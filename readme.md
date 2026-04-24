@@ -1,5 +1,3 @@
----
-
 # 🔁 Reusable Temporal Worker Runtime — Build & Deploy Guide
 
 ## 🚀 Step 1 — Build Docker Image Locally
