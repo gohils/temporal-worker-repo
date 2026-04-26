@@ -1,0 +1,896 @@
+# temporal_router.py
+from fastapi.responses import JSONResponse
+from fastapi import FastAPI, APIRouter, File, Query, Request, UploadFile, Form, HTTPException
+import requests
+import os
+import json
+from pydantic import BaseModel
+import uuid
+import logging
+from typing import List, Optional, Dict, Any
+from datetime import datetime, timedelta
+
+
+from temporalio.client import Client, WorkflowHandle
+import asyncio
+
+# Import DB abstraction layer
+import routers.process_db as db
+from routers.services.ai_service import BlobService
+
+from routers.erp_router import router as erp_router
+from routers.crud_router import router as crud_router
+from routers.ai_doc_router import router as ai_doc_router
+from routers.ai_doc_llm_router import router as ai_doc_llm_router
+
+from fastapi.middleware.cors import CORSMiddleware
+
+
+
+
+logger = logging.getLogger(__name__)
+
+# ------------------------------------------------
+# FastAPI App
+# ------------------------------------------------
+router = APIRouter(prefix="/workflow", tags=["Workflow Fast API"])
+
+
+TEMPORAL_HOST = os.getenv("TEMPORAL_HOST", "localhost:7233")
+DEFAULT_TASK_QUEUE = os.getenv("TASK_QUEUE", "default-task-queue")
+
+"""Lazy singleton Temporal client with retry safety."""
+_client: Client | None = None
+_lock = asyncio.Lock()
+
+async def get_client() -> Client:
+    """Lazy singleton with one retry if connection is stale."""
+    global _client
+
+    if _client:
+        try:
+            # lightweight check (fast)
+            await _client.workflow_service.get_system_info()
+            return _client
+        except Exception:
+            logger.warning("⚠️ Temporal client stale. Reconnecting once...")
+            _client = None  # force reconnect
+
+    async with _lock:
+        if _client:
+            return _client
+
+        try:
+            logger.info("🔌 Connecting to Temporal...")
+            _client = await Client.connect(TEMPORAL_HOST)
+            logger.info("✅ Temporal connected")
+            return _client
+        except Exception as e:
+            logger.error(f"❌ Temporal connection failed: {e}")
+            raise  # fail THIS request (no infinite retry)
+
+# -------------------------------
+# workflow and Signal request model
+# -------------------------------
+class WorkflowStartRequest(BaseModel):
+    workflow_type: str = "HybridEnterpriseSTPWorkflow"
+    workflow_prefix: str = "AI_DOC_Workflow"
+    domain: str = "ProcessAutomation"
+    input_parameters: Dict[str, Any] 
+    task_queue: str = DEFAULT_TASK_QUEUE
+
+class WorkflowSignalRequest(BaseModel):
+    workflow_id: str = "AI_DOC_Workflow-xxxxxxxx"
+    signal_name: str = "manual_approval"
+    signal_input: Dict[str, Any] = {"decision": "APPROVED", "user_id": "Sid", "comments": "Document verified, ready to onboard"}
+    task_queue: str = DEFAULT_TASK_QUEUE
+
+# ------------------------------------------------
+# Models
+# ------------------------------------------------
+class DocumentInput(BaseModel):
+    doc_type: Optional[str] = None
+    document_url: Optional[str] = "https://zblobarchive.blob.core.windows.net/samples/aus-passport-sample1.png"
+    document_id: Optional[str] = None
+    declared_data: Optional[Dict[str, Any]] = None
+
+class ProcessCreateRequest(BaseModel):
+    reference_id: Optional[str] 
+    workflow_type: str = "HybridEnterpriseSTPWorkflow"
+    process_name: str = "KYC"
+    process_group: str = "Sales"
+    declared_data: Dict[str, Any] = None
+    additional_data: Optional[Dict[str, Any]] = None
+
+class HeaderUpdateRequest(BaseModel):
+    workflow_type: Optional[str] = "HybridEnterpriseSTPWorkflow"
+    process_name: Optional[str] = "KYC"
+    process_group: Optional[str] = "Sales"
+    declared_data: Optional[Dict[str, Any]] = None
+    additional_data: Optional[Dict[str, Any]] = None
+    verification_status: Optional[str] = None
+    verification_comments: Optional[str] = None
+
+# ------------------------------------------------
+# API Endpoints
+# ------------------------------------------------
+CLOUD_UPLOAD_API = "https://zdoc-ai-api.azurewebsites.net/azure-image"
+
+# ------------------------------
+# Pydantic models
+# ------------------------------
+class ItemDocument(BaseModel):
+    doc_type: str  # declared by user
+    file_name: str
+
+# class KycSubmissionRequest(BaseModel):
+#     first_name: str
+#     last_name: str
+#     email: str
+#     phone: str
+#     address: str
+#     documents: List[ItemDocument]
+
+# ------------------------------
+# Helper to upload file to cloud
+# ------------------------------
+# def upload_file_to_cloud(file: UploadFile) -> str:
+#     """
+#     Upload file to Azure API and return the file URL.
+#     """
+#     url = "https://zdoc-ai-api.azurewebsites.net/azure-image"
+#     files = {"file": (file.filename, file.file, file.content_type)}
+#     response = requests.post(url, files=files)
+#     if response.status_code != 200:
+#         raise HTTPException(500, f"File upload failed: {response.text}")
+#     data = response.json()
+#     return data.get("fileUrl")
+
+def upload_file_to_cloud(file: UploadFile) -> str:
+    """
+    Upload file using internal BlobService (no external HTTP call).
+    Returns Azure file URL.
+    """
+    try:
+        return BlobService.upload(file)
+    except Exception as e:
+        raise HTTPException(500, f"File upload failed: {str(e)}")
+    
+# ------------------------------
+# Process Submission Endpoint
+# ------------------------------
+@router.post("/kyc/submit")
+async def submit_new_kyc_process_details(
+    request: Request,
+    firstName: str = Form(...),
+    lastName: str = Form(...),
+    email: str = Form(...),
+    phone: str = Form(...),
+    address: str = Form(...),
+    documents: List[UploadFile] = File(...),
+    declared_doc_types: List[str] = Form(...)
+):
+    """
+    Submit KYC information with multiple documents.
+    Generates a business-friendly reference_id, uploads files, stores header + items.
+    """
+    print("======input form data submit_kyc=====\n", await request.form())
+    if not documents or len(documents) != len(declared_doc_types):
+        raise HTTPException(400, "Number of documents and declared_doc_types must match")
+    
+    # 1️⃣ Generate business-friendly reference_id (case ID)
+    today = datetime.now().strftime("%Y%m%d")
+    short_uuid = str(uuid.uuid4().hex[:6]).upper()
+    reference_id = f"KYC-{today}-{short_uuid}"
+
+    # 2️⃣ Prepare declared_data for header
+    declared_data = {
+        "first_name": firstName,
+        "last_name": lastName,
+        "email": email,
+        "phone": phone,
+        "address": address
+    }
+
+    # 3️⃣ Create header in DB
+    header_id = db.create_process_header({
+        "reference_id": reference_id,
+        "workflow_type": "CustomerOnboardingWorkflow",
+        "process_name": "KYC",
+        "process_group": "Sales",
+        "declared_data": declared_data,
+        "verification_status": "PROCESSING",
+        "additional_data": {"submission_source": "customer_portal"}
+    })
+
+    # 4️⃣ Upload documents and create items
+    item_ids = []
+    doc_results = []
+    for file, doc_type in zip(documents, declared_doc_types):
+        file_url = upload_file_to_cloud(file)
+        
+        item_id = db.create_process_item({
+            "header_id": header_id,
+            "doc_type": doc_type,               
+            "document_url": file_url,
+            "declared_data": {"document_type": doc_type}, # declared by user
+            "status": "PROCESSING",
+            "is_active": True
+        })
+        item_ids.append(item_id)
+        doc_results.append({"doc_type": doc_type, "document_url": file_url})
+    
+    # 5️⃣ Return response to UI
+    return {
+        "reference_id": reference_id,
+        "header_id": header_id,
+        "documents": doc_results,
+        "message": "KYC submitted successfully. Use reference_id to track status."
+    }
+
+@router.post("/invoice/submit")
+async def submit_invoice(
+    request: Request,
+    invoiceNumber: str = Form(...),
+    invoiceDate: str = Form(...),
+    vendorName: str = Form(...),
+    amount: str = Form(...),
+    description: str = Form(...),
+    invoiceFile: UploadFile = File(...),
+):
+    today = datetime.now().strftime("%Y%m%d")
+    short_uuid = str(uuid.uuid4().hex[:6]).upper()
+    reference_id = f"INV-{today}-{short_uuid}"
+
+    header_id = db.create_process_header({
+        "reference_id": reference_id,
+        "workflow_type": "InvoiceProcessingWorkflow",
+        "process_name": "Invoice",
+        "process_group": "Finance",
+        "declared_data": {
+            "invoice_number": invoiceNumber,
+            "invoice_date": invoiceDate,
+            "vendor_name": vendorName,
+            "amount": amount,
+            "description": description,
+        },
+        "verification_status": "PROCESSING",
+        "additional_data": {"submission_source": "invoice_portal"}
+    })
+
+    file_url = upload_file_to_cloud(invoiceFile)
+    item_id = db.create_process_item({
+        "header_id": header_id,
+        "doc_type": "invoice",
+        "document_url": file_url,
+        "declared_data": {"document_type": "invoice"},
+        "status": "PROCESSING",
+        "is_active": True
+    })
+
+    return {
+        "reference_id": reference_id,
+        "header_id": header_id,
+        "document": {"doc_type": "invoice", "document_url": file_url},
+        "message": "Invoice submitted successfully. Use reference_id to track status."
+    }
+
+@router.post("/claims/submit")
+async def submit_claim(
+    request: Request,
+
+    employeeId: str = Form(...),
+    employeeName: str = Form(...),
+    description: str = Form(...),
+
+    expenseTypes: List[str] = Form(...),
+    amounts: List[str] = Form(...),
+    expenseDates: List[str] = Form(...),
+
+    files: List[UploadFile] = File(...)
+):
+    """
+    - Header first
+    - Then items
+    - No mixing of item data into header declared_data
+    """
+
+    print(await request.form())
+
+    # ---------------- VALIDATION ----------------
+    if len(files) != len(expenseTypes):
+        raise HTTPException(400, "Files and expense types must match")
+
+    if not (len(expenseTypes) == len(amounts) == len(expenseDates)):
+        raise HTTPException(400, "Item arrays must match")
+
+    # ---------------- 1. GENERATE CLAIM ID ----------------
+    today = datetime.now().strftime("%Y%m%d")
+    short_uuid = uuid.uuid4().hex[:6].upper()
+    reference_id = f"CLM-{today}-{short_uuid}"
+
+    # ---------------- 2. HEADER DECLARED DATA ----------------
+    declared_data = {
+        "employee_id": employeeId,
+        "employee_name": employeeName,
+        "description": description
+    }
+
+    # ---------------- 3. CREATE HEADER ----------------
+    header_id = db.create_process_header({
+        "reference_id": reference_id,
+        "workflow_type": "ExpenseClaimWorkflow",
+        "process_name": "ExpenseClaim",
+        "process_group": "Finance",
+        "declared_data": declared_data,
+        "verification_status": "PROCESSING",
+        "additional_data": {
+            "submission_source": "employee_portal"
+        }
+    })
+
+    # ---------------- 4. CREATE ITEMS (LIKE KYC) ----------------
+    item_ids = []
+    item_results = []
+
+    for file, expense_type, amount, date in zip(
+        files, expenseTypes, amounts, expenseDates
+    ):
+        file_url = upload_file_to_cloud(file)
+
+        item_id = db.create_process_item({
+            "header_id": header_id,
+            "doc_type": expense_type,
+            "document_url": file_url,
+            "declared_data": {
+                "expense_type": expense_type,
+                "amount": amount,
+                "expense_date": date
+            },
+            "status": "PROCESSING",
+            "is_active": True
+        })
+
+        item_ids.append(item_id)
+
+        item_results.append({
+            "item_id": item_id,
+            "expense_type": expense_type,
+            "document_url": file_url
+        })
+
+    # ---------------- 5. RESPONSE ----------------
+    return {
+        "reference_id": reference_id,
+        "header_id": header_id,
+        "items": item_results,
+        "message": "Claim submitted successfully"
+    }
+
+@router.post("/process/create")
+async def create_process(req: ProcessCreateRequest):
+    """ Create process with header + items (stores document_id + document_url). \n 
+    ```json
+    {
+        "reference_id": "CUST-10001",
+        "workflow_type": "CustomerOnboardingWorkflow",
+        "process_name": "KYC",
+        "process_group": "Sales",
+        "declared_data": {
+                "customer_id": "CUST-10001",
+                "first_name": "Anthony",
+                "last_name": "Marcus",
+                "email": "anthony.marcus@example.com",
+                "phone": "+61-400-000-000",
+                "address": "15 Main Street, Melbourne, VIC 3000"
+            },
+        "additional_data": {
+            "channel": "web",
+            "source": "self_service_portal"
+            }
+    }
+    {
+        "reference_id": "INV901101",
+        "workflow_type": "HybridEnterpriseSTPWorkflow",
+        "process_name": "INVOICE_PROCESSING",
+        "process_group": "FINANCE",
+        "declared_data": {
+            "purchase_order": "PO101101",
+            "country": "Australia"
+        }
+    }
+    """
+    try:
+        header_id = db.create_process_header({
+            "reference_id": req.reference_id or f"REF-{uuid.uuid4().hex[:6]}",
+            "workflow_type": req.workflow_type,
+            "process_name": req.process_name,
+            "process_group": req.process_group,
+            "declared_data": req.declared_data,
+            "verification_status": "PROCESSING",
+            "additional_data": req.additional_data or {}
+        })
+        return {"header_id": header_id, "reference_id": req.reference_id}
+    except Exception as e:
+        print(f"❌ create_process failed: {e}")
+        raise HTTPException(500, "Failed to create process")
+
+@router.post("/process/add_item")
+async def add_item(reference_id: str, documents: List[DocumentInput]):
+    """
+    Add one or more document items to an existing process header.
+    For each document type, previous active documents are deactivated. \n
+    ```json
+    [
+        {
+            "doc_type": null,
+            "document_url": "https://zblobarchive.blob.core.windows.net/samples/driver_license.png",
+            "declared_data": {"document_type_hint": "driver_license"}
+        },
+        {
+            "doc_type": null,
+            "document_url": "https://zblobarchive.blob.core.windows.net/samples/aus-passport-sample1.png",
+            "declared_data": {"document_type_hint": "passport"}
+        },
+        {
+            "doc_type": null,
+            "document_url": "https://zblobarchive.blob.core.windows.net/samples/utility_bill.png",
+            "declared_data": {"document_type_hint": "utility_bill"}
+        }
+    ]
+    [{  "doc_type": "Invoice",
+        "document_id": "INV901101",
+        "document_url": "https://zblobarchive.blob.core.windows.net/samples/invoice-iphone1.png",
+        "declared_data": { "invoice_date": "2023-12-25" }  }]
+
+    """
+    header = db.get_process_header_by_reference(reference_id)
+    if not header:
+        raise HTTPException(404, "Case not found")
+    header_id = header["id"]
+    item_ids = []
+    for doc in documents:
+        db.deactivate_existing_item(header_id, doc.doc_type)
+        item_id = db.create_process_item({
+            "header_id": header_id,
+            "doc_type": doc.doc_type,
+            "document_id":doc.document_id,
+            "document_url": doc.document_url,
+            "declared_data": doc.declared_data,
+            "status": "PROCESSING"
+        })
+        item_ids.append(item_id)
+    db.update_process_header(header_id, {
+        "verification_status": "PROCESSING",
+        "verification_comments": f"{len(documents)} document(s) added"
+    })
+    return {"header_id": header_id, "item_ids": item_ids}
+
+@router.patch("/process/{header_id}")
+async def update_header(header_id: int, req: HeaderUpdateRequest):
+    """
+    Update header metadata dynamically.
+    Only updates fields provided in the request.
+    """
+    header = db.get_process_header(header_id)
+    if not header:
+        raise HTTPException(404, "Header not found")
+    update_data = {k: v for k, v in req.dict().items() if v is not None}
+    if not update_data:
+        raise HTTPException(400, "No valid fields provided for update")
+    db.update_process_header(header_id, update_data)
+    return {"header": db.get_process_header(header_id)}
+
+@router.get("/monitor/headers")
+def get_headers(
+    workflow_type: Optional[str] = None,
+    process_name: Optional[str] = None,
+    verification_status: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None
+):
+    """
+    Fetch all process headers with optional filters.
+    Example: /monitor/headers?workflow_type=KYC&process_name=Customer%20Onboarding&verification_status=REVIEW
+    """
+    return db.list_process_headers(workflow_type, process_name, verification_status, start_date, end_date)
+
+
+
+@router.get("/process/{header_id}")
+async def get_process(header_id: int):
+    """Fetch process by header_id."""
+    header = db.get_process_header(header_id)
+    if not header:
+        raise HTTPException(404, "Not found")
+    items = db.get_items_by_header(header_id)
+    return {"header": header, "items": items}
+
+@router.get("/process/reference/{reference_id}")
+async def get_by_reference(reference_id: str):
+    """Fetch process by reference_id."""
+    header = db.get_process_header_by_reference(reference_id)
+    if not header:
+        raise HTTPException(404, "Not found")
+
+    items = db.get_items_by_header(header["id"])
+
+    enriched_items = []
+    for item in items:
+        ocr = db.get_latest_ocr_by_item(item["id"])
+
+        enriched_items.append({
+            **item,
+            "extractedFields": ocr.get("extracted_fields") if ocr else None,
+            "ocr_status": ocr.get("status") if ocr else "PENDING"
+        })
+
+    return {
+        "header": header,
+        "items": enriched_items
+    }
+
+
+# ------------------------------
+# Workflow Monitoring Endpoints
+# ------------------------------
+@router.get("/monitor/workflows")
+def list_workflows(status: Optional[str] = None, start_date: Optional[str] = None, end_date: Optional[str] = None):
+    """Fetch wokflows with optional filters: /monitor/workflows?status=COMPLETED&start_date=2024-01-01&end_date=2024-12-31"""
+    return db.list_workflows(status, start_date, end_date)
+
+
+@router.get("/monitor/tasks")
+def list_approval_tasks():
+    """Fetch all approval tasks."""
+    return db.list_approval_tasks()
+
+
+@router.get("/monitor/workflows/{workflow_id}")
+def workflow_detail(workflow_id: str):
+    """Fetch detailed information about a specific workflow."""
+    result = db.get_workflow_detail(workflow_id)
+    if not result:
+        raise HTTPException(404, "Workflow not found")
+    return result
+
+@router.get("/monitor/workflows/activity/{activity_id}")
+def activity_detail(activity_id: str):
+    """Fetch detailed information about a specific activity."""
+    result = db.get_activity_detail(activity_id)
+    if not result:
+        raise HTTPException(404, "Activity not found")
+    return result
+
+@router.get("/monitor/workflows/graph/{workflow_id}")
+def workflow_graph(workflow_id: str):
+    """
+    Returns ReactFlow-ready execution graph.
+
+    Fixes:
+    - No "None:" prefix bug
+    - Clean SINGLE vs MULTI execution handling
+    - Stable node identity for ReactFlow matching
+    - Correct edge deduplication
+    """
+
+    result = db.get_workflow_graph_data(workflow_id)
+
+    if not result:
+        raise HTTPException(status_code=404, detail="Workflow not found")
+
+    wf = result["workflow"]
+    activities = result["activities"]
+
+    nodes = []
+    edges = []
+
+    edge_set = set()
+
+    # -----------------------------
+    # DETERMINE EXECUTION MODE
+    # -----------------------------
+    workflow_type = wf.get("workflow_type")
+
+    is_multi_branch = workflow_type in [
+        "CustomerOnboardingWorkflow"
+    ]
+
+    # -----------------------------
+    # HELPERS
+    # -----------------------------
+    def safe_branch(branch_id: str | None):
+        """
+        IMPORTANT:
+        Never allow None / MAIN pollution in node IDs.
+        """
+        if not is_multi_branch:
+            return None
+        if not branch_id:
+            return None
+        if branch_id.upper() == "MAIN":
+            return None
+        return branch_id
+
+    def build_node_id(base_id: str, branch_id: str | None):
+        branch = safe_branch(branch_id)
+        return f"{branch}:{base_id}" if branch else base_id
+
+    def build_prev_node_id(prev_base: str | None, branch_id: str | None):
+        if not prev_base:
+            return None
+        branch = safe_branch(branch_id)
+        return f"{branch}:{prev_base}" if branch else prev_base
+
+    # -----------------------------
+    # BUILD GRAPH
+    # -----------------------------
+    for a in activities:
+        base_id = a["node_id"] or a["activity_id"]
+        branch_id = a.get("branch_id")
+
+        branch = safe_branch(branch_id)
+
+        node_id = build_node_id(base_id, branch)
+        prev_node_id = build_prev_node_id(a.get("prev_node_id"), branch)
+
+        # -----------------------------
+        # NODE (DEDUP IMPORTANT)
+        # -----------------------------
+        nodes.append({
+            "id": node_id,
+            "type": "default",
+            "data": {
+                "label": a.get("display_name") or a.get("step_key"),
+                "status": a.get("status"),
+                "activity_id": a.get("activity_id"),
+                "branch_id": branch,   # normalized
+                "template_node_id": base_id
+            }
+        })
+
+        # -----------------------------
+        # EDGE
+        # -----------------------------
+        if prev_node_id:
+            edge_key = f"{prev_node_id}->{node_id}"
+
+            if edge_key not in edge_set:
+                edges.append({
+                    "id": edge_key,
+                    "source": prev_node_id,
+                    "target": node_id,
+                    "animated": a.get("status") == "RUNNING"
+                })
+                edge_set.add(edge_key)
+
+    # -----------------------------
+    # RETURN
+    # -----------------------------
+    return {
+        "workflow_id": wf["workflow_id"],
+        "status": wf["status"],
+        "workflow_type": workflow_type,
+        "execution_mode": "MULTI" if is_multi_branch else "SINGLE",
+        "nodes": nodes,
+        "edges": edges
+    }
+
+class SQLQuery(BaseModel):
+    sql_query: str = """SELECT id, workflow_type, declared_data FROM automation_process_header LIMIT 5;"""  
+
+@router.post("/api/app_data_retrieval")
+def run_any_query(query: SQLQuery):
+    raw_sql = query.sql_query.strip()
+    sql_lower = raw_sql.lower()
+
+    # ✅ Allow only SELECT queries
+    if not sql_lower.startswith("select"):
+        raise HTTPException(status_code=400, detail="Only SELECT queries are allowed")
+
+    # ❌ Block dangerous keywords
+    forbidden = ["insert", "update", "delete", "drop", "alter", "truncate"]
+    if any(word in sql_lower for word in forbidden):
+        raise HTTPException(status_code=400, detail="Forbidden SQL operation detected")
+
+    # ✅ Enforce LIMIT (basic protection)
+    if "limit" not in sql_lower:
+        raw_sql += " LIMIT 100"
+    try:
+        rows = db.run_query(raw_sql)
+        return {"data": rows, "meta": {"count": len(rows)}}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# -------------------------------
+# Start workflow (non-blocking)
+# -------------------------------
+@router.post("/workflow_start/")
+async def start_workflow(req: WorkflowStartRequest):
+    """Start a workflow asynchronously. Returns immediately with workflow_id and status.
+        ```json
+        {
+        "workflow_type": "HybridEnterpriseSTPWorkflow",
+        "workflow_prefix": "AI_DOC_Workflow",
+        "domain": "ProcessAutomation",
+        "input_parameters": {
+            "document_url": "https://zblobarchive.blob.core.windows.net/samples/invoice-iphone1.png"
+        },
+        "task_queue": "default-task-queue"
+        }
+        {
+        "workflow_type": "CustomerOnboardingWorkflow",
+        "workflow_prefix": "CustomerOnboarding",
+        "domain": "RetailBanking",
+        "task_queue": "customer-onboarding",
+            "input_parameters": {
+            "reference_id": "CUST-10001",
+            "documents": [
+                {
+                "document_url": "https://zblobarchive.blob.core.windows.net/samples/aus_dl_sample1.JPG",
+                "declared_data": {"document_type": "driver_license"}
+                },
+                {
+                "document_url": "https://zblobarchive.blob.core.windows.net/samples/aus-passport-sample1.png",
+                "declared_data": {"document_type": "passport"}
+                },
+                {
+                "document_url": "https://zblobarchive.blob.core.windows.net/samples/agl_sample1.jpg",
+                "declared_data": {"document_type": "utility_bill"}
+                }
+            ]
+            }
+            
+        }
+    """
+    client = await get_client()
+    workflow_id = f"{req.workflow_prefix}-{uuid.uuid4()}"
+
+    print(f"🚀 Starting workflow {workflow_id} of type {req.workflow_type} with input:\n{json.dumps(req.input_parameters, indent=2)} ")
+    try:
+        await client.start_workflow(
+            req.workflow_type,
+            args=[req.dict()],
+            id=workflow_id,
+            task_queue=req.task_queue
+        )
+        return {"workflow_id": workflow_id, "status": "started"}
+    except Exception as e:
+        raise HTTPException(500, f"Failed to start workflow: {e}")
+
+# -------------------------------
+# Start workflow by reference_id (fetch header + items) - non-blocking
+# -------------------------------
+# ✅ workflow TASK QUEUE MAP
+TASK_QUEUE_MAP = {
+    "InvoiceProcessingWorkflow": "finance-invoice-queue",
+    "CustomerOnboardingWorkflow": "kyc-onboarding-queue",
+}
+@router.post("/workflow_start_by_reference/{reference_id}")
+async def start_workflow_by_reference(reference_id: str):
+    """
+    Fetch process by reference_id (header + items) and start a Temporal workflow.
+    Returns immediately with workflow_id and status.
+    """
+    # 1️⃣ Fetch header
+    header = db.get_process_header_by_reference(reference_id)
+    if not header:
+        raise HTTPException(404, "Header not found")
+
+    workflow_name = header.get("workflow_type")
+    if not workflow_name:
+        raise HTTPException(400, "Missing workflow_type")
+
+    # 2️⃣ Resolve task queue
+    task_queue = TASK_QUEUE_MAP.get(workflow_name)
+    if not task_queue:
+        raise HTTPException(400, f"No task queue configured for {workflow_name}")
+
+    # 3️⃣ Fetch items
+    items = db.get_items_by_header(header["id"])
+    if not items:
+        raise HTTPException(400, "No items found for processing")
+
+    # 4️⃣ Normalize items (CRITICAL FIX)
+    clean_items = []
+    for item in items:
+        document_url = item.get("document_url")
+
+        if not document_url:
+            raise HTTPException(400, "Missing document_url")
+
+        clean_items.append({
+            "item_id": item.get("id"),  # ✅ normalized
+            "doc_type": item.get("doc_type") or "invoice",
+            "input_parameters": {
+                "document_url": document_url
+            },
+            "declared_data": item.get("declared_data", {})
+        })
+
+    # 5️⃣ Construct workflow input
+    workflow_input = {
+        "reference_id": header.get("reference_id"),
+        "header_id": header.get("id"),
+        "workflow_type": workflow_name,
+        "process_name": header.get("process_name"),
+        "process_group": header.get("process_group"),
+        "domain": "FINANCE",  # can be dynamic later
+        "declared_data": header.get("declared_data"),
+        "additional_data": header.get("additional_data"),
+        "items": clean_items
+    }
+
+    # 6️⃣ Idempotent workflow ID (IMPORTANT)
+    lv_time = datetime.now().strftime("%Y%m%d%H%M")
+    workflow_id = f"{header.get('reference_id')}-{lv_time}"
+
+    print("🚀 Workflow Input:\n", workflow_input)
+
+    # 7️⃣ Start workflow
+    client = await get_client()
+
+    try:
+        await client.start_workflow(
+            workflow_name,          # ✅ direct (no mapping)
+            args=[workflow_input],
+            id=workflow_id,
+            task_queue=task_queue   # ✅ mapped queue
+        )
+
+        return {
+            "workflow_id": workflow_id,
+            "task_queue": task_queue,
+            "status": "started"
+        }
+
+    except Exception as e:
+        raise HTTPException(500, f"Failed to start workflow: {e}")
+    
+# -------------------------------
+# Terminate workflow
+# -------------------------------
+@router.post("/workflow_terminate/{workflow_id}")
+async def terminate_workflow(workflow_id: str):
+    client = await get_client()
+    try:
+        handle = client.get_workflow_handle(workflow_id)
+        await handle.terminate(reason="Force terminate due to failure")
+        return {"workflow_id": workflow_id, "status": "terminated"}
+    except Exception as e:
+        raise HTTPException(500, f"Terminate failed: {str(e)}")
+    
+# -------------------------------
+# Endpoint to send signal
+# -------------------------------
+@router.post("/workflow_signal/")
+async def send_signal(req: WorkflowSignalRequest):
+    """ Send a signal to a running workflow APPROVED or REJECTED.
+    ```json
+    {
+    "workflow_id": "INV-20260407-C8725B",
+    "signal_name": "manual_approval",
+    "signal_input": {
+        "decision": "APPROVED",
+        "user_id": "Sid",
+        "comments": "Invoice Document verified, ready to process"
+    },
+    "task_queue": "finance-invoice-queue"
+    }   
+    """
+    client = await get_client()
+    try:
+        handle: WorkflowHandle = client.get_workflow_handle(req.workflow_id)
+        await handle.signal(req.signal_name, req.signal_input)
+
+        return {
+            "workflow_id": req.workflow_id,
+            "signal": req.signal_name,
+            "status": "sent",
+            "logged_at": datetime.utcnow().isoformat()
+        }
+
+    except Exception as e:
+        print(f"❌ send_signal failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to send signal: {e}")
+    
