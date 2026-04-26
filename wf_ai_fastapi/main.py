@@ -15,11 +15,11 @@ from temporalio.client import Client, WorkflowHandle
 import asyncio
 
 # Import DB abstraction layer
-from routers.temporal_router import router as temporal_router
-from routers.crud_router import router as crud_router
-from routers.ai_doc_router import router as ai_doc_router
-from routers.ai_doc_llm_router import router as ai_doc_llm_router
-from routers.erp_router import router as erp_router
+from wf_ai_fastapi.routers.temporal_router import router as temporal_router
+from wf_ai_fastapi.routers.crud_router import router as crud_router
+from wf_ai_fastapi.routers.ai_doc_router import router as ai_doc_router
+from wf_ai_fastapi.routers.ai_doc_llm_router import router as ai_doc_llm_router
+from wf_ai_fastapi.routers.erp_router import router as erp_router
 
 from fastapi.middleware.cors import CORSMiddleware
 

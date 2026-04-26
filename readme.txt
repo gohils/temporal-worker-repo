@@ -238,7 +238,7 @@ az containerapp revision restart \
 docker run -it --rm -p 8000:8000 \
   -e GIT_REPO=https://github.com/gohils/temporal-worker-repo.git \
   -e BRANCH=main \
-  -e APP_MODULE=wf_fastapi.main:app \
+  -e APP_MODULE=wf_ai_fastapi.main:app \
   -e TASK_QUEUE=default-task-queue\
   -e TEMPORAL_HOST=temporal-server-demo.australiaeast.cloudapp.azure.com:7233 \
   -e PORT=8000 \
