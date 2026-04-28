@@ -1,3 +1,6 @@
+# local fastapi run from subfolder via python module like this
+python -m wf_ai_fastapi.main
+
 .env file contains no spaces around =:
 
 GIT_REPO=https://github.com/gohils/temporal-worker-repo.git

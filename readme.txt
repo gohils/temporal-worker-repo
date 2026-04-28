@@ -27,6 +27,13 @@ docker push ghcr.io/gohils/reusable-fastapi-runtime:latest
 ---
 
 ## 🧪 Step 4 — Run Fastapi Locally (POC / Testing)
+# Local developer testing with local code without git repo
+MSYS_NO_PATHCONV=1 docker run -it --rm --env-file .env -p 8000:8000 \
+  --mount type=bind,source="$(pwd)",target=/workspace/app \
+  -e WORKSPACE=/workspace/app \
+  -e APP_MODULE=wf_ai_fastapi.main:app \
+  ghcr.io/gohils/reusable-fastapi-runtime:latest
+
 #.env file contains no spaces around =:
 GIT_REPO=https://github.com/gohils/temporal-worker-repo.git
 BRANCH=main
