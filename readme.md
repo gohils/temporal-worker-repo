@@ -25,9 +25,23 @@ docker push ghcr.io/gohils/reusable-temporal-runtime:latest
 ---
 
 ## 🧪 Step 4 — Run Locally (POC / Testing)
+```bash
+docker run -d \
+  --name temporal-worker \
+  --restart unless-stopped \
+  --env-file .env \
+  -p 8000:8000 \
+  -e GIT_REPO=https://github.com/gohils/temporal-worker-repo.git \
+  -e BRANCH=main \
+  -e APP_MODULE=wf_ai_fastapi.main:app \
+  -e TASK_QUEUE=default-task-queue \
+  -e TEMPORAL_HOST=<YOUR_TEMPORAL_HOST>:7233 \
+  -e PORT=8000 \
+  ghcr.io/gohils/reusable-fastapi-runtime:latest
+```
 
 ### 🧾 Fastapi docker local test with .env
-
+Ineteractive docker test
 ```bash
 docker run -it --rm --env-file .env -p 8000:8000 \
   -e GIT_REPO=https://github.com/gohils/temporal-worker-repo.git \
