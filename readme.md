@@ -25,22 +25,21 @@ docker push ghcr.io/gohils/reusable-temporal-runtime:latest
 ---
 
 ## 🧪 Step 4 — Run Locally (POC / Testing)
+### 🧾 Fastapi docker local test with .env or on cloud VM
 ```bash
 docker run -d \
   --name temporal-worker \
   --restart unless-stopped \
-  --env-file .env \
   -p 8000:8000 \
   -e GIT_REPO=https://github.com/gohils/temporal-worker-repo.git \
   -e BRANCH=main \
-  -e APP_MODULE=wf_ai_fastapi.main:app \
+  -e APP_MODULE=wf_fastapi.main:app \
   -e TASK_QUEUE=default-task-queue \
-  -e TEMPORAL_HOST=<YOUR_TEMPORAL_HOST>:7233 \
+  -e TEMPORAL_HOST=35.244.75.185:7233 \
   -e PORT=8000 \
   ghcr.io/gohils/reusable-fastapi-runtime:latest
 ```
 
-### 🧾 Fastapi docker local test with .env
 Ineteractive docker test
 ```bash
 docker run -it --rm --env-file .env -p 8000:8000 \
@@ -50,6 +49,21 @@ docker run -it --rm --env-file .env -p 8000:8000 \
   -e TASK_QUEUE=default-task-queue \
   -e TEMPORAL_HOST=temporal-server-demo.australiaeast.cloudapp.azure.com:7233 \
   -e PORT=8000 \
+  ghcr.io/gohils/reusable-fastapi-runtime:latest
+```
+
+---
+### 💳 Payment test Worker
+
+```bash
+docker run -d \
+  --name temporal-payment-test-worker \
+  --restart unless-stopped \
+  -e GIT_REPO=https://github.com/gohils/temporal-worker-repo.git \
+  -e BRANCH=main \
+  -e WORKER_FILE=worker-template/worker.py \
+  -e TASK_QUEUE=payments-task-queue \
+  -e TEMPORAL_HOST=35.244.75.185:7233 \
   ghcr.io/gohils/reusable-fastapi-runtime:latest
 ```
 
