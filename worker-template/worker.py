@@ -116,6 +116,9 @@ async def validate(payload: dict) -> dict:
     print("\n[ACTIVITY] VALIDATE")
     print(f"[ACTIVITY INPUT] {payload}")
 
+    # ⏳ DEMO DELAY (simulate processing)
+    await asyncio.sleep(3)
+
     if payload["amount"] <= 0:
         print("[ACTIVITY] Validation FAILED\n")
         return {"approved": False, "reason": "invalid amount"}
@@ -128,6 +131,8 @@ async def validate(payload: dict) -> dict:
 async def charge(payload: dict) -> dict:
     print("\n[ACTIVITY] CHARGE")
     print(f"[ACTIVITY INPUT] {payload}")
+    # ⏳ DEMO DELAY (simulate processing)
+    await asyncio.sleep(4)
 
     result = {
         "transaction_id": str(uuid.uuid4()),
@@ -142,6 +147,8 @@ async def charge(payload: dict) -> dict:
 async def send_receipt(payload: dict):
     print("\n[ACTIVITY] SEND RECEIPT")
     print(f"[ACTIVITY INPUT] {payload}")
+    # ⏳ DEMO DELAY (simulate processing)
+    await asyncio.sleep(3)
     print("[ACTIVITY] Email sent successfully\n")
 
 
