@@ -539,6 +539,45 @@ def list_workflows(status: Optional[str] = None, start_date: Optional[str] = Non
     """Fetch wokflows with optional filters: /monitor/workflows?status=COMPLETED&start_date=2024-01-01&end_date=2024-12-31"""
     return db.list_workflows(status, start_date, end_date)
 
+# Returns all workflow executions for a given reference_id, ordered by newest first.
+@router.get("/history/{reference_id}")
+def get_workflow_history(reference_id: str):
+    """
+    Returns all workflow executions for a given reference_id.
+    Ordered by newest first.
+    """
+
+    # Fetch all workflows linked to reference_id
+    results = db.get_workflow_history_by_reference(reference_id)
+
+    if not results:
+        raise HTTPException(404, "No workflows found for reference_id")
+
+    return {
+        "reference_id": reference_id,
+        "count": len(results),
+        "workflows": results
+    }
+
+# Returns latest workflow execution for a given reference_id (most recent created_at).
+@router.get("/latest/{reference_id}")
+def get_latest_workflow(reference_id: str):
+    """
+    Returns latest workflow execution for a given reference_id.
+    """
+
+    result = db.get_latest_workflow_by_reference(reference_id)
+
+    if not result:
+        raise HTTPException(404, "No workflow found for reference_id")
+
+    return {
+        "reference_id": reference_id,
+        "workflow_id": result["workflow_id"],
+        "status": result["status"],
+        "workflow_type": result.get("workflow_type"),
+        "created_at": result.get("created_at")
+    }
 
 @router.get("/monitor/tasks")
 def list_approval_tasks():

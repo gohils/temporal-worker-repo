@@ -1,19 +1,15 @@
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel, Field
+from typing import List, Dict, Any, Optional
 import os
 import json
-from typing import List, Dict, Any
-
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
 from azure.core.credentials import AzureKeyCredential
 from azure.ai.formrecognizer import DocumentAnalysisClient
 from openai import OpenAI
 
-from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
-from typing import Any
-import os
-import json
-from openai import OpenAI
+# Import DB abstraction layer
+from wf_ai_fastapi.routers import bpm_prompts
+import wf_ai_fastapi.routers.process_db as db
 
 # ---------------------------
 # Environment Validation
@@ -59,74 +55,95 @@ class AIClients:
             )
         return cls._doc_client
 
-# ---------------------------
-# LLM Reasoning
-# ---------------------------
-# ---------------------------
-DEFAULT_PROMPT = """
-You are an AI decision engine replacing a human decision-maker in a business workflow.
-Return valid JSON only.
-Workflow Context:
-Invoice Details:
-{ "invoice_number": "INV-2026-001",  "vendor": "ACME Supplies",  "invoice_date": "2026-03-01",
-  "line_items": [ { "item": "Laptop", "quantity": 10, "unit_price": 13000} ],
-  "total_amount": 13000 USD,
-  "additional_notes": "Urgent procurement"
-}
+# =========================================================
+# REQUEST / RESPONSE
+# =========================================================
+class AIRequest(BaseModel):
+    action: str
+    context: Dict[str, Any] = Field(default_factory=dict)
+    options: Optional[Dict[str, Any]] = Field(default_factory=dict)
 
-Business Rule:
-- If invoice total > 10,000 USD → HIGH_VALUE , Otherwise → NORMAL
 
-Task:
-1. Review the full invoice context above.
-2. Decide if this invoice is HIGH_VALUE or NORMAL.
+class AIResponse(BaseModel):
+    action: str
+    final_prompt: str
+    result: Dict[str, Any]
+    raw_response: Optional[str] = None
+    confidence: Optional[float] = None
 
-Return JSON only with these keys:
-{
-  "invoice_key_details": {  },
-  "invoice_valuation": "HIGH_VALUE | NORMAL",
-  "details": "reasoning for audit"
-}
+BUSINESS_SUMMARY_PROMPT = """
+You are a business operations assistant.
+
+Convert structured workflow analysis into a SHORT business explanation.
+
+Rules:
+- max 3–5 sentences
+- no JSON
+- simple business language
+- no technical terms like "OCR", "workflow_id"
+- focus on what happened + current status + next implication
+
+INPUT:
+{data}
+
+OUTPUT:
+A short business-friendly summary.
 """
 
-class LLMRequest(BaseModel):
-    input_prompt: str = DEFAULT_PROMPT
-    model: str = "gpt-4o-mini"
-    temperature: float = 0
-    max_tokens: int = 100
-
-class LLMResponse(BaseModel):
-    response_json: Dict[str, Any]
-    response_raw_text: str
-    input_context: str
-
-@router.post("/ai-reasoning", response_model=LLMResponse)
-async def ai_reasoning(request: LLMRequest):
-
-    response = AIClients.llm().chat.completions.create(
-        model=request.model,
-        messages=[
-            {"role": "system", "content": "You are an AI decision engine replacing a human decision-maker in a business workflow."},
-            {"role": "user", "content": request.input_prompt}
-        ],
-        temperature=request.temperature,
-        max_tokens=request.max_tokens
-    )
-
-    raw = response.choices[0].message.content
-    # print("Received LLM reasoning request. Processing..request.input_prompt :\n", request.input_prompt)
-    # print("Raw LLM response:\n", raw)
+# ---------------------------
+# LLM AI reasoning Endpoint
+# ---------------------------
+@router.post("/ai-reasoning", response_model=AIResponse)
+async def ai_reasoning(req: AIRequest):
+    """Endpoint for AI reasoning on documents with action-aware context building and unified prompt transformation.
+            where_in_lifecycle, is_everything_correct, needs_attention, root_cause, what_next
+    ```json
+    {
+        "action": "where_in_lifecycle",
+        "context": {
+            "workflowId": "INV-20260414-B125B3-202604141803",
+            "headerId": 34,
+            "referenceId": "INV-20260414-B125B3"
+            }
+    }
+    ```
+    """
     try:
-        output = json.loads(raw)
-    except json.JSONDecodeError:
-        output = {"decision": None, "confidence": None, "reasoning_trace": raw}
+        # 1. build transaction context
+        header_id = req.context.get("headerId")
+        transaction_state_context = bpm_prompts.get_transaction_state(header_id)
 
-    return LLMResponse(
-        response_json=output,
-        response_raw_text=raw,
-        input_context=request.input_prompt
-    )
+        # 2. single unified transformation
+        final_prompt = bpm_prompts.build_prompt(req.action, transaction_state_context)
 
+        # 3. LLM call
+        response = AIClients.llm().chat.completions.create(
+            model=req.options.get("model", "gpt-4o-mini"),
+            messages=[
+                {"role": "system", "content": "Return ONLY JSON."},
+                {"role": "user", "content": final_prompt},
+            ],
+            temperature=0
+        )
+
+        raw = response.choices[0].message.content
+
+        try:
+            parsed = json.loads(raw)
+        except:
+            parsed = {"error": "invalid_json", "raw_response": raw}
+
+        return AIResponse(
+            action=req.action,
+            final_prompt=final_prompt,
+            result=parsed,
+            raw_response=raw,
+            confidence=parsed.get("confidence")
+        )
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    
 # ---------------------------
 # OCR Request Model
 # ---------------------------

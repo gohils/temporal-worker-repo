@@ -4,7 +4,6 @@ from typing import Dict, Any, List
 import psycopg
 from psycopg.rows import dict_row
 import os
-import json
 import uuid
 
 router = APIRouter(prefix="/entity", tags=["entity-engine"])
@@ -12,7 +11,7 @@ router = APIRouter(prefix="/entity", tags=["entity-engine"])
 POSTGRES_CONNECTION_STRING = os.getenv("POSTGRES_CONNECTION_STRING")
 
 # =====================================================
-# SAFE TABLE WHITELIST (IMPORTANT SECURITY LAYER)
+# SECURITY: ALLOWED TABLES ONLY (prevent SQL abuse)
 # =====================================================
 ALLOWED_TABLES = {
     "vendor_master",
@@ -21,7 +20,7 @@ ALLOWED_TABLES = {
 }
 
 # =====================================================
-# DB CONNECTION
+# DB CONNECTION FACTORY
 # =====================================================
 def get_conn():
     return psycopg.connect(
@@ -29,8 +28,9 @@ def get_conn():
         row_factory=dict_row
     )
 
+
 # =====================================================
-# MODELS
+# REQUEST MODELS
 # =====================================================
 class EntityPayload(BaseModel):
     data: Dict[str, Any]
@@ -40,189 +40,50 @@ class BulkEntityPayload(BaseModel):
     records: List[Dict[str, Any]]
 
 
-class EntityConfig(BaseModel):
-    entity_name: str
-    table_name: str
-    pk: str
-    config: dict
-
-
 # =====================================================
-# FETCH ENTITY METADATA
+# ENTITY META RESOLVER (TABLE + PK)
+# Uses PostgreSQL system catalog (no registry dependency)
 # =====================================================
 def get_entity_meta(entity: str):
+
+    # # 1. Validate allowed table
+    # if entity not in ALLOWED_TABLES:
+    #     raise HTTPException(400, "Table not allowed")
+
+    table = entity
+
+    # 2. Fetch primary key from PostgreSQL system tables
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute("""
-            SELECT table_name, pk
-            FROM entity_registry
-            WHERE entity_name = %s
-        """, (entity,))
-        meta = cur.fetchone()
-
-    if not meta:
-        raise HTTPException(404, f"Entity '{entity}' not found")
-
-    table = meta["table_name"]
-    pk = meta["pk"]
-
-    if table not in ALLOWED_TABLES:
-        raise HTTPException(400, "Table not allowed")
-
-    return table, pk
-
-
-# =====================================================
-# CREATE / UPDATE ENTITY REGISTRY
-# =====================================================
-@router.post("/registry")
-def upsert_entity_registry(payload: EntityConfig):
-    """
-    Create or update entity metadata registry
-
-    ```json
-    {
-      "entity_name": "vendor",
-      "table_name": "vendor_master",
-      "pk": "vendor_id",
-      "config": {
-        "ui": "drawer_grid",
-        "grid_columns": ["vendor_name", "country", "status"]
-      }
-    }
-    ```
-    """
-
-    sql = """
-    INSERT INTO entity_registry (entity_name, table_name, pk, config)
-    VALUES (%s, %s, %s, %s)
-    ON CONFLICT (entity_name)
-    DO UPDATE SET
-        table_name = EXCLUDED.table_name,
-        pk = EXCLUDED.pk,
-        config = EXCLUDED.config,
-        updated_at = now()
-    RETURNING *;
-    """
-
-    with get_conn() as conn, conn.cursor() as cur:
-        cur.execute(
-            sql,
-            (
-                payload.entity_name,
-                payload.table_name,
-                payload.pk,
-                json.dumps(payload.config),
-            ),
-        )
-        conn.commit()
-        return cur.fetchone()
-
-
-# =====================================================
-# GET ENTITY REGISTRY
-# =====================================================
-@router.get("/registry/{entity_name}")
-def get_entity_registry(entity_name: str):
-    """
-    Get entity configuration and UI metadata
-
-    Example:
-    GET /entity/registry/product
-    """
-
-    with get_conn() as conn, conn.cursor() as cur:
-        cur.execute("""
-            SELECT table_name, pk, config
-            FROM entity_registry
-            WHERE entity_name = %s
-        """, (entity_name,))
-        meta = cur.fetchone()
-
-        if not meta:
-            raise HTTPException(404, "Entity not found")
-
-        table = meta["table_name"]
-        pk = meta["pk"]
-        config = meta["config"] or {}
-
-        cur.execute("""
-            SELECT column_name, data_type
-            FROM information_schema.columns
-            WHERE table_name = %s
-            ORDER BY ordinal_position
+            SELECT a.attname AS pk
+            FROM pg_index i
+            JOIN pg_attribute a
+              ON a.attrelid = i.indrelid
+             AND a.attnum = ANY(i.indkey)
+            WHERE i.indrelid = %s::regclass
+              AND i.indisprimary
         """, (table,))
-        columns = cur.fetchall()
+        pk_row = cur.fetchone()
 
-    fields = []
+    if not pk_row:
+        raise HTTPException(400, "Primary key not found")
 
-    for col in columns:
-        name = col["column_name"]
-        override = config.get("overrides", {}).get(name, {})
-
-        fields.append({
-            "name": name,
-            "type": override.get("type", "text"),
-            "label": override.get("label", name),
-            "options": override.get("options"),
-            "required": override.get("required", False)
-        })
-
-    return {
-        "entity": entity_name,
-        "table": table,
-        "pk": pk,
-        "ui": config.get("ui", "drawer_grid"),
-        "grid_columns": config.get(
-            "grid_columns",
-            [c["column_name"] for c in columns]
-        ),
-        "fields": fields
-    }
+    return table, pk_row["pk"]
 
 
 # =====================================================
-# CREATE RECORD (FIXED PK GENERATION)
+# CREATE RECORD
+# - auto-generates PK if missing
 # =====================================================
 @router.post("/{entity}")
 def create_entity(entity: str, payload: EntityPayload):
-    """
-    Create a new record
-
-    Example:
-    ```json
-    {
-      "data": {
-        "vendor_id": "VEND-0007",
-        "vendor_name": "ABC Corp",
-        "tax_id": "12345",
-        "address": "Sydney",
-        "payment_terms": "Net 30",
-        "currency": "AUD",
-        "status": "Active"
-      }
-    }
-    ```
-
-    OR (auto ID allowed):
-    ```json
-    {
-      "data": {
-        "vendor_name": "ABC Corp",
-        "status": "Active"
-      }
-    }
-    ```
-    """
 
     table, pk = get_entity_meta(entity)
     data = payload.data
 
-    # ==========================
-    # AUTO PK GENERATION FIX
-    # ==========================
-    if pk not in data or not data[pk]:
-        prefix = entity[:4].upper()
-        data[pk] = f"{prefix}-{uuid.uuid4().hex[:8].upper()}"
+    # Auto-generate primary key if missing
+    if not data.get(pk):
+        data[pk] = f"{entity[:4].upper()}-{uuid.uuid4().hex[:8].upper()}"
 
     cols = list(data.keys())
     values = list(data.values())
@@ -244,12 +105,6 @@ def create_entity(entity: str, payload: EntityPayload):
 # =====================================================
 @router.get("/{entity}")
 def list_entity(entity: str):
-    """
-    Get all records for an entity
-
-    Example:
-    GET /entity/vendor
-    """
 
     table, _ = get_entity_meta(entity)
 
@@ -259,24 +114,15 @@ def list_entity(entity: str):
 
 
 # =====================================================
-# GET SINGLE RECORD
+# GET SINGLE RECORD BY PRIMARY KEY
 # =====================================================
 @router.get("/{entity}/{record_id}")
 def get_entity_record(entity: str, record_id: str):
-    """
-    Get single record by ID
-
-    Example:
-    GET /entity/product/PROD-0006
-    """
 
     table, pk = get_entity_meta(entity)
 
     with get_conn() as conn, conn.cursor() as cur:
-        cur.execute(
-            f"SELECT * FROM {table} WHERE {pk} = %s",
-            (record_id,)
-        )
+        cur.execute(f"SELECT * FROM {table} WHERE {pk} = %s", (record_id,))
         row = cur.fetchone()
 
     if not row:
@@ -286,23 +132,10 @@ def get_entity_record(entity: str, record_id: str):
 
 
 # =====================================================
-# UPDATE RECORD
+# UPDATE RECORD (partial update supported)
 # =====================================================
 @router.put("/{entity}/{record_id}")
 def update_entity(entity: str, record_id: str, payload: EntityPayload):
-    """
-    Update existing record
-
-    Example:
-    ```json
-    {
-      "data": {
-        "vendor_name": "Updated Corp",
-        "status": "Inactive"
-      }
-    }
-    ```
-    """
 
     table, pk = get_entity_meta(entity)
     data = payload.data
@@ -328,20 +161,63 @@ def update_entity(entity: str, record_id: str, payload: EntityPayload):
 # =====================================================
 @router.delete("/{entity}/{record_id}")
 def delete_entity(entity: str, record_id: str):
-    """
-    Delete record
-
-    Example:
-    DELETE /entity/vendor/VEND-0001
-    """
 
     table, pk = get_entity_meta(entity)
 
     with get_conn() as conn, conn.cursor() as cur:
-        cur.execute(
-            f"DELETE FROM {table} WHERE {pk} = %s",
-            (record_id,)
-        )
+        cur.execute(f"DELETE FROM {table} WHERE {pk} = %s", (record_id,))
         conn.commit()
 
     return {"status": "deleted", "id": record_id}
+
+
+# =====================================================
+# BULK REPLACE (ALV GRID SAVE)
+# - deletes all rows
+# - inserts fresh dataset
+# =====================================================
+@router.post("/{entity}/replace")
+def replace(entity: str, payload: BulkEntityPayload):
+
+    table, pk = get_entity_meta(entity)
+
+    if not payload.records:
+        raise HTTPException(400, "Empty payload")
+
+    inserted = 0
+
+    with get_conn() as conn, conn.cursor() as cur:
+
+        # 1. wipe table (full replace semantics)
+        cur.execute(f"DELETE FROM {table}")
+
+        # 2. insert all rows
+        for row in payload.records:
+
+            if not isinstance(row, dict):
+                continue
+
+            # remove empty/null values
+            cleaned = {k: v for k, v in row.items() if v not in (None, "")}
+
+            if not cleaned:
+                continue
+
+            cols = list(cleaned.keys())
+            vals = list(cleaned.values())
+
+            col_sql = ",".join(f'"{c}"' for c in cols)
+            val_sql = ",".join(["%s"] * len(cols))
+
+            sql = f"INSERT INTO {table} ({col_sql}) VALUES ({val_sql})"
+
+            cur.execute(sql, vals)
+            inserted += 1
+
+        conn.commit()
+
+    return {
+        "status": "replaced",
+        "rows_received": len(payload.records),
+        "rows_inserted": inserted
+    }

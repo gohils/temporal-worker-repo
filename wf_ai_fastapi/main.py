@@ -19,6 +19,7 @@ from wf_ai_fastapi.routers.temporal_router import router as temporal_router
 from wf_ai_fastapi.routers.crud_router import router as crud_router
 from wf_ai_fastapi.routers.ai_doc_router import router as ai_doc_router
 from wf_ai_fastapi.routers.ai_doc_llm_router import router as ai_doc_llm_router
+from wf_ai_fastapi.routers.ai_bpm_llm_router import router as ai_bpm_llm_router
 from wf_ai_fastapi.routers.entity_router import router as entity_router
 from wf_ai_fastapi.routers.tx_entity_router import router as tx_entity_router
 from wf_ai_fastapi.routers.erp_router import router as erp_router
@@ -46,6 +47,7 @@ app.add_middleware(
 app.include_router(temporal_router)
 app.include_router(ai_doc_llm_router)
 app.include_router(ai_doc_router)
+app.include_router(ai_bpm_llm_router)
 app.include_router(crud_router)
 app.include_router(entity_router)
 app.include_router(tx_entity_router)

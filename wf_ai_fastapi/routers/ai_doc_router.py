@@ -1,6 +1,6 @@
 import os, uuid
 from dotenv import load_dotenv
-
+from pydantic import BaseModel, Field
 from fastapi import APIRouter, UploadFile, HTTPException
 from azure.storage.blob import BlobServiceClient
 from azure.core.credentials import AzureKeyCredential
@@ -216,6 +216,86 @@ async def classify_document(url: str):
         }
 
 
+# =========================================================
+# ---------------------------
+# OCR Request Model
+# ---------------------------
+class AnalyzeRequest(BaseModel):
+    ai_model_name: str = "prebuilt-read"
+    document_url: str = "https://zblobarchive.blob.core.windows.net/samples/aus-passport-sample1.png"
+    response_format: str = "plain_text"
+# ---------------------------
+# Extraction Helpers
+# ---------------------------
+def extract_plain_text(result):
+    return "\n\n".join(
+        "\n".join(line.content for line in page.lines) for page in result.pages
+    )
+
+def extract_flat_fields(result):
+    docs = []
+    for doc in result.documents:
+        data = {}
+        for k, f in (doc.fields or {}).items():
+            data[k] = (
+                getattr(f, "value_string", None)
+                or str(getattr(f, "value_date", None))
+                or getattr(f, "value_number", None)
+                or getattr(getattr(f, "value_currency", None), "amount", None)
+                or getattr(f, "content", None)
+            )
+        docs.append(data)
+    return docs
+
+def extract_structured(result):
+    docs = []
+    for doc in result.documents:
+        header, items = {}, []
+        for k, f in doc.fields.items():
+            if k.lower() != "items" and hasattr(f, "content"):
+                header[k] = f.content
+        items_field = doc.fields.get("Items")
+        if items_field and hasattr(items_field, "value"):
+            for item in items_field.value:
+                items.append({k: getattr(v, "content", None) for k, v in item.value.items()})
+        docs.append({"header": header, "items": items})
+    return docs
+# ---------------------------
+# OCR Endpoint
+# ---------------------------
+@router.post("/analyze-document-prebuilt-model")
+async def analyze_document(request: AnalyzeRequest):
+    """Endpoint to analyze document using specified prebuilt model
+       \nai_model_name : prebuilt-read, prebuilt-layout, prebuilt-idDocument, prebuilt-invoice, prebuilt-receipt
+      \n return format : plain_text, flat, structured (in header-item format).
+    """
+
+    try:
+        poller = AzureClients.doc_client().begin_analyze_document_from_url(
+            model_id=request.ai_model_name,
+            document_url=request.document_url
+        )
+        result = poller.result()
+
+        if request.response_format == "plain_text":
+            extracted = extract_plain_text(result)
+        elif request.response_format == "flat":
+            extracted = extract_flat_fields(result)
+        elif request.response_format == "structured":
+            extracted = extract_structured(result)
+        else:
+            raise HTTPException(400, "Invalid response_format")
+
+        return {
+            "model_used": request.ai_model_name,
+            "response_format": request.response_format,
+            "documents": extracted
+        }
+
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
 # --- UPLOAD (FIXED SINGLETON USAGE) ---
 
 @router.post("/azure-image")
@@ -240,3 +320,4 @@ async def upload(file: UploadFile):
 
         file_url = "https://zblobarchive.blob.core.windows.net/documents/" + str(file_name)
         return {"fileUrl": file_url}
+    

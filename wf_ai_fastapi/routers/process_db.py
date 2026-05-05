@@ -271,6 +271,53 @@ def list_workflows(status=None, start_date=None, end_date=None):
         cur.execute(query, tuple(params))
         return fetch_all(cur)
 
+def get_workflow_history_by_reference(reference_id: str):
+    """Fetch all workflow instances for a reference_id (timeline view)."""
+
+    query = """
+        SELECT workflow_id,
+               workflow_type,
+               status,
+               domain,
+               header_id,
+               reference_id,
+               start_time,
+               end_time,
+               created_at,
+               updated_at
+        FROM workflow_instance
+        WHERE reference_id = %s
+        ORDER BY created_at DESC
+    """
+
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(query, (reference_id,))
+        return fetch_all(cur)
+    
+def get_latest_workflow_by_reference(reference_id: str):
+    """Fetch latest workflow instance for navigation."""
+
+    query = """
+        SELECT workflow_id,
+               workflow_type,
+               status,
+               domain,
+               header_id,
+               reference_id,
+               start_time,
+               end_time,
+               created_at,
+               updated_at
+        FROM workflow_instance
+        WHERE reference_id = %s
+        ORDER BY created_at DESC
+        LIMIT 1
+    """
+
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(query, (reference_id,))
+        rows = fetch_all(cur)
+        return rows[0] if rows else None
 
 def list_approval_tasks():
     """Fetch all approval tasks."""
