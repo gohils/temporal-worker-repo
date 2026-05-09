@@ -104,6 +104,48 @@ docker run -it --rm \
   ghcr.io/gohils/reusable-temporal-runtime:latest
 ```
 
+## 💳 deploy 3 Worker Deployment
+```bash
+az containerapp create \
+  --name temporal-worker-invoice \
+  --resource-group 1-aca-rg \
+  --environment zacaenv1 \
+  --image ghcr.io/gohils/reusable-fastapi-runtime:latest \
+  --ingress internal \
+  --env-vars \
+    GIT_REPO=https://github.com/gohils/temporal-worker-repo.git \
+    BRANCH=main \
+    WORKER_FILE=worker-invoice/ai_doc_invoice_worker_v2.py \
+    TASK_QUEUE=finance-invoice-queue \
+    TEMPORAL_HOST=temporal-server-demo.australiaeast.cloudapp.azure.com:7233
+
+
+az containerapp create \
+  --name temporal-worker-kyc \
+  --resource-group 1-aca-rg \
+  --environment zacaenv1 \
+  --image ghcr.io/gohils/reusable-fastapi-runtime:latest \
+  --ingress internal \
+  --env-vars \
+    GIT_REPO=https://github.com/gohils/temporal-worker-repo.git \
+    BRANCH=main \
+    WORKER_FILE=worker-kyc/ai_doc_kyc_worker_v2.py \
+    TASK_QUEUE=kyc-onboarding-queue \
+    TEMPORAL_HOST=temporal-server-demo.australiaeast.cloudapp.azure.com:7233
+
+az containerapp create \
+  --name temporal-worker-directdebit \
+  --resource-group 1-aca-rg \
+  --environment zacaenv1 \
+  --image ghcr.io/gohils/reusable-fastapi-runtime:latest \
+  --ingress internal \
+  --env-vars \
+    GIT_REPO=https://github.com/gohils/temporal-worker-repo.git \
+    BRANCH=main \
+    WORKER_FILE=worker-directdebit/ai_doc_directdebit_worker.py \
+    TASK_QUEUE=direct-debit-queue \
+    TEMPORAL_HOST=temporal-server-demo.australiaeast.cloudapp.azure.com:7233
+```
 ---
 
 # 🐳 OPTION B — DOCKER COMPOSE (WITH SCALING SUPPORT)
@@ -304,7 +346,7 @@ az containerapp create \
   --resource-group 1-aca-rg \
   --environment zacaenv1 \
   --image ghcr.io/gohils/reusable-fastapi-runtime:latest \
-  --ingress disabled \
+  --ingress internal \
   --env-vars \
     GIT_REPO=https://github.com/gohils/temporal-worker-repo.git \
     BRANCH=main \
@@ -323,7 +365,7 @@ az containerapp create \
   --resource-group 1-aca-rg \
   --environment zacaenv1 \
   --image ghcr.io/gohils/reusable-fastapi-runtime:latest \
-  --ingress disabled \
+  --ingress internal \
   --env-vars \
     GIT_REPO=https://github.com/gohils/temporal-worker-repo.git \
     BRANCH=main \
