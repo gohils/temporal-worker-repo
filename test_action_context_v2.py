@@ -127,31 +127,37 @@ def build_snapshot(header_id: int):
 # 🔥 LLM PROMPT (STRICT, NO FLUFF)
 # =========================================================
 SYSTEM_PROMPT = """
-You are a business report formatter.
+You are a business transaction status engine.
 
-RULES:
-- Do not change input data
-- Do not infer missing fields
-- Output ONLY valid JSON
+You must produce BOTH:
+1. Structured JSON (for system use)
+2. Human-readable summary (for business user)
+
+STRICT RULES:
+- Always include transaction id
+- Always include key business fields (vendor, amount if available)
+- Never invent data
+- Never output generic explanations
+- Human output must be structured, concise, and scannable
+
+OUTPUT MUST BE VALID JSON ONLY.
 
 OUTPUT FORMAT:
+
 {
-  "structured": object (unchanged input),
-  "human_readable": string (exactly 2 sentences)
+  "structured": {
+    "transaction": "...",
+    "lifecycle_position": "...",   // STEP (STATUS, DECISION if exists)
+    "path": "...",
+    "status_map": {},              // MUST be object, not string
+    "completed_steps": [],
+    "blocking_step": null,
+    "waiting_for": null,
+    "next_action": "...",
+    "confidence_note": "..."
+  },
+  "human_readable": "MULTI-LINE TEXT"
 }
-
-HUMAN_READABLE RULE (STRICT):
-
-Sentence 1 MUST be exactly:
-"The invoice transaction {transaction} from vendor {vendor} for the amount of {amount} has been {status}."
-
-Where:
-- status = workflow.state.workflow.status
-
-Sentence 2:
-One sentence describing lifecycle state and next action using only provided fields.
-
-NO deviations allowed.
 """
 
 def build_prompt(snapshot: Dict[str, Any]):
@@ -192,7 +198,8 @@ INSTRUCTIONS:
    - manual approval → assigned_to
    - else null
 
-7. next_action:
+7. next_action: (provide one of the following based on lifecycle position completed_steps and blocking logic)
+   - start workflow if not started → "Start workflow"
    - approval pending → "Review approval queue"
    - completed → "No action required"
    - failed → "Fix validation issue"
@@ -201,22 +208,13 @@ INSTRUCTIONS:
    MUST reference real signals (approval, ERP, validation)
 
 9. HUMAN Readable Business Summary GUIDELINES:
-Include following with Exactly 2 sentences only with following key insights:
+Include following with less than 3 sentences only with following key insights:
 - Lifecycle Status with key data points (transaction + vendor + amount + position etc.)
 - Completed Steps (only evidence-backed)
 - Current Status (blocking or completed)
 
-FORMAT RULE:
-- Exactly 2 sentences only
-
-Sentence 1:
-Describe current lifecycle state in plain business language.
-
-Sentence 2:
-Describe what is happening next (or completion status).
-
 STYLE:
-- Business executive tone
+- Business tone writing communicating key insights to a business user
 - No JSON-like formatting
 
 Keep concise. No paragraphs. No fluff.
@@ -257,7 +255,7 @@ def run_llm(prompt: str):
 if __name__ == "__main__":
 
     # testing single action for faster iteration
-    headers = [31, 34]
+    headers = [34]
     for header_id in headers:
 
         snapshot = build_snapshot(header_id)
@@ -265,10 +263,10 @@ if __name__ == "__main__":
         print(f"\n================ SNAPSHOT header_id ===== {header_id} ============\n")
         print(json.dumps(snapshot, indent=2))
 
-        # prompt = build_prompt(snapshot)
+        prompt = build_prompt(snapshot)
 
         print(f"\n================ LLM OUTPUT header_id ===== {header_id} ============\n")
-        result = run_llm(json.dumps(snapshot, indent=2))
+        result = run_llm(prompt)
 
         print(f"\n================ LLM OUTPUT header_id ===== {header_id} ============\n")
         print(result)

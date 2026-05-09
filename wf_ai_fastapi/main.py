@@ -23,6 +23,7 @@ from wf_ai_fastapi.routers.ai_bpm_llm_router import router as ai_bpm_llm_router
 from wf_ai_fastapi.routers.entity_router import router as entity_router
 from wf_ai_fastapi.routers.tx_entity_router import router as tx_entity_router
 from wf_ai_fastapi.routers.erp_router import router as erp_router
+from wf_ai_fastapi.routers.salesforce_router import router as salesforce_router
 
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -51,7 +52,7 @@ app.include_router(ai_bpm_llm_router)
 app.include_router(crud_router)
 app.include_router(entity_router)
 app.include_router(tx_entity_router)
-
+app.include_router(salesforce_router)
 # ------------------------------------------------
 # Run FastAPI
 # ------------------------------------------------

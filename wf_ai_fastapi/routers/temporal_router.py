@@ -275,6 +275,74 @@ async def submit_invoice(
         "message": "Invoice submitted successfully. Use reference_id to track status."
     }
 
+@router.post("/direct-debit/submit")
+async def submit_direct_debit(
+    request: Request,
+    firstName: str = Form(...),
+    lastName: str = Form(...),
+    email: str = Form(None),
+    phone: str = Form(None),
+    accountNumber: str = Form(...),
+    document: UploadFile = File(...),
+):
+    # -----------------------------
+    # 1. Generate Reference ID
+    # -----------------------------
+    today = datetime.now().strftime("%Y%m%d")
+    short_uuid = str(uuid.uuid4().hex[:6]).upper()
+    reference_id = f"DDR-{today}-{short_uuid}"
+
+    # -----------------------------
+    # 2. Create Process Header
+    # -----------------------------
+    header_id = db.create_process_header({
+        "reference_id": reference_id,
+        "workflow_type": "DirectDebitWorkflow",
+        "process_name": "DirectDebit",
+        "process_group": "Payments",
+        "declared_data": {
+            "first_name": firstName,
+            "last_name": lastName,
+            "email": email,
+            "phone": phone,
+            "account_number": accountNumber,
+        },
+        "verification_status": "PROCESSING",
+        "additional_data": {
+            "submission_source": "direct_debit_portal"
+        }
+    })
+
+    # -----------------------------
+    # 3. Upload Document (Scanned DDR form)
+    # -----------------------------
+    file_url = upload_file_to_cloud(document)
+
+    item_id = db.create_process_item({
+        "header_id": header_id,
+        "doc_type": "direct_debit_form",
+        "document_url": file_url,
+        "declared_data": {
+            "document_type": "direct_debit_form"
+        },
+        "status": "PROCESSING",
+        "is_active": True
+    })
+
+    # -----------------------------
+    # 4. Response to UI
+    # -----------------------------
+    return {
+        "reference_id": reference_id,
+        "header_id": header_id,
+        "item_id": item_id,
+        "document": {
+            "doc_type": "direct_debit_form",
+            "document_url": file_url
+        },
+        "message": "Direct Debit Request submitted successfully. Use reference_id to track status."
+    }
+
 @router.post("/claims/submit")
 async def submit_claim(
     request: Request,
@@ -593,6 +661,22 @@ def workflow_detail(workflow_id: str):
         raise HTTPException(404, "Workflow not found")
     return result
 
+@router.delete("/monitor/workflows/{workflow_id}")
+def delete_workflow(workflow_id: str):
+    """
+    Delete workflow instance and all related records.
+    """
+
+    result = db.delete_workflow(workflow_id)
+
+    if not result:
+        raise HTTPException(
+            status_code=404,
+            detail="Workflow not found"
+        )
+
+    return result
+
 @router.get("/monitor/workflows/activity/{activity_id}")
 def activity_detail(activity_id: str):
     """Fetch detailed information about a specific activity."""
@@ -804,7 +888,8 @@ async def start_workflow(req: WorkflowStartRequest):
 TASK_QUEUE_MAP = {
     "InvoiceProcessingWorkflow": "finance-invoice-queue",
     "CustomerOnboardingWorkflow": "kyc-onboarding-queue",
-}
+    "DirectDebitWorkflow": "direct-debit-queue",
+    "ExpenseClaimWorkflow": "expense-claim-queue"}
 @router.post("/workflow_start_by_reference/{reference_id}")
 async def start_workflow_by_reference(reference_id: str):
     """
@@ -933,3 +1018,18 @@ async def send_signal(req: WorkflowSignalRequest):
         print(f"❌ send_signal failed: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to send signal: {e}")
     
+@router.delete("/process/{header_id}")
+def delete_process_header(header_id: int):
+    """
+    Delete process header and all related items.
+    """
+
+    result = db.delete_process_header(header_id)
+
+    if not result:
+        raise HTTPException(
+            status_code=404,
+            detail="Process header not found"
+        )
+
+    return result

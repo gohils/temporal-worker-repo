@@ -22,6 +22,15 @@ def get_conn():
     """Return a new DB connection using psycopg."""
     return psycopg.connect(POSTGRES_CONNECTION_STRING, row_factory=dict_row)
 
+ALLOWED_VIEWS = {
+    "vw_stg_erp_direct_debit_ocr",
+    "vw_stg_erp_invoice_header_ocr",
+    "vw_stg_erp_invoice_items_ocr",
+    "vw_stg_erp_driver_license_ocr",
+    "vw_stg_erp_passport_ocr",
+    "vw_stg_erp_utility_bill_ocr"
+}
+
 # --------------------------------------------------
 # MULTILINE RAW SQL ENDPOINT
 # --------------------------------------------------
@@ -97,3 +106,127 @@ def get_table_schema(table: str):
         """, (table,))
         schema = cur.fetchall()
     return {"table": table, "columns": schema}
+
+# --------------------------------------------------
+# GET list of allowed views
+# --------------------------------------------------
+@router.get("/views")
+def list_views():
+    return [
+        {
+            "name": v,
+            "label": v.replace("ui_", "").replace("_", " ").title()
+        }
+        for v in sorted(ALLOWED_VIEWS)
+    ]
+
+# --------------------------------------------------
+# GET view schema
+# --------------------------------------------------
+@router.get("/views/{view}/schema")
+def get_schema(view: str):
+
+    if view not in ALLOWED_VIEWS:
+        raise HTTPException(403, "View not allowed")
+
+    with get_conn() as conn, conn.cursor() as cur:
+
+        cur.execute("""
+            SELECT
+                column_name,
+                data_type
+            FROM information_schema.columns
+            WHERE table_name = %s
+            ORDER BY ordinal_position
+        """, (view,))
+
+        columns = cur.fetchall()
+
+    return {
+        "view": view,
+        "columns": columns
+    }
+
+# --------------------------------------------------
+# GET view data with pagination
+# --------------------------------------------------
+@router.get("/views/{view}/data")
+def get_data(
+    view: str,
+    limit: int = Query(50, le=500),
+    offset: int = 0
+):
+
+    if view not in ALLOWED_VIEWS:
+        raise HTTPException(403, "View not allowed")
+
+    sql = f"""
+        SELECT *
+        FROM {view}
+        LIMIT %s OFFSET %s
+    """
+
+    with get_conn() as conn, conn.cursor() as cur:
+
+        cur.execute(sql, (limit, offset))
+        rows = cur.fetchall()
+
+    return {
+        "rows": rows,
+        "limit": limit,
+        "offset": offset
+    }
+
+# --------------------------------------------------
+# GET view data with schema + total count + pagination
+# --------------------------------------------------
+@router.get("/views/{view}")
+def get_view_data(
+    view: str,
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0)
+):
+
+    if view not in ALLOWED_VIEWS:
+        raise HTTPException(403, "View not allowed")
+
+    with get_conn() as conn, conn.cursor() as cur:
+
+        # ---------------------------
+        # 1. Schema
+        # ---------------------------
+        cur.execute("""
+            SELECT column_name, data_type
+            FROM information_schema.columns
+            WHERE table_name = %s
+            ORDER BY ordinal_position
+        """, (view,))
+        schema = cur.fetchall()
+
+        # ---------------------------
+        # 2. Total count
+        # ---------------------------
+        cur.execute(f"SELECT COUNT(*) AS total FROM {view}")
+        total = cur.fetchone()["total"]
+
+        # ---------------------------
+        # 3. Data
+        # ---------------------------
+        cur.execute(f"""
+            SELECT *
+            FROM {view}
+            LIMIT %s OFFSET %s
+        """, (limit, offset))
+
+        rows = cur.fetchall()
+
+    return {
+        "view": view,
+        "schema": schema,
+        "rows": rows,
+        "total": total,
+        "pagination": {
+            "limit": limit,
+            "offset": offset
+        }
+    }

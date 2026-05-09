@@ -25,12 +25,13 @@ with workflow.unsafe.imports_passed_through():
 # Environment and Task Queue
 # -----------------------------
 
-# TEMPORAL_HOST =  "localhost:7233"  
+
 TEMPORAL_HOST = os.getenv("TEMPORAL_HOST", "temporal-server-demo.australiaeast.cloudapp.azure.com:7233")
-# TASK_QUEUE = os.getenv("TASK_QUEUE", "finance-invoice-queue")
-TASK_QUEUE = "finance-invoice-queue"
+TASK_QUEUE = os.getenv("TASK_QUEUE", "finance-invoice-queue")
 AI_API_URL = os.getenv("AI_API_URL", "https://zdoc-ai-api.azurewebsites.net")
 
+# TEMPORAL_HOST =  "localhost:7233"  
+# TASK_QUEUE = "finance-invoice-queue"
 # -----------------------------
 # Data Contracts
 # -----------------------------
@@ -218,8 +219,94 @@ async def validate_document(input: ActivityInput) -> ActivityOutput:
         {"validate": {"type": classification}}
     )
 
+
 @activity.defn
-@log_activity(display_name="05_DECISION")
+@log_activity(display_name="05_3WAY_MATCHING")
+async def financial_matching_3way(input: ActivityInput) -> ActivityOutput:
+    """
+    Performs 3-way matching:
+    PO vs GR vs Invoice
+    """
+
+    print("🔍 [3-WAY MATCHING] Starting financial reconciliation")
+
+    invoice = input.payload.get("invoice_data", {})
+    invoice_id = invoice.get("invoice_id")
+    vendor = invoice.get("vendor_name")
+    invoice_total = invoice.get("invoice_total")
+
+    # -------------------------------------------------
+    # MOCK / REPLACE WITH REAL ERP CALLS
+    # -------------------------------------------------
+    def get_po_data(invoice_id):
+        return {
+            "po_id": "PO-123",
+            "vendor_name": vendor,
+            "total_qty": 10,
+            "unit_price": 100,
+            "expected_total": 1000
+        }
+
+    def get_gr_data(invoice_id):
+        return {
+            "gr_id": "GR-456",
+            "received_qty": 10
+        }
+
+    po = get_po_data(invoice_id)
+    gr = get_gr_data(invoice_id)
+
+    # -------------------------------------------------
+    # MATCHING LOGIC
+    # -------------------------------------------------
+
+    po_match = abs(po["expected_total"] - invoice_total) < 0.01
+
+    gr_match = gr["received_qty"] == po["total_qty"]
+
+    vendor_match = po["vendor_name"] == vendor
+
+    overall_match = po_match and gr_match and vendor_match
+
+    mismatch_reasons = []
+
+    if not vendor_match:
+        mismatch_reasons.append("VENDOR_MISMATCH")
+
+    if not po_match:
+        mismatch_reasons.append("PRICE_MISMATCH")
+
+    if not gr_match:
+        mismatch_reasons.append("QUANTITY_MISMATCH")
+
+    status = "MATCHED" if overall_match else "MISMATCH"
+
+    print(f"📊 [3-WAY MATCH] Status={status}, Reasons={mismatch_reasons}")
+
+    # if not overall_match:
+    #     raise Exception(f"3-way match failed: {mismatch_reasons}")
+    return ActivityOutput(
+        {
+            **input.payload,
+            "po_data": po,
+            "gr_data": gr,
+            "three_way_match": {
+                "status": status,
+                "po_match": po_match,
+                "gr_match": gr_match,
+                "vendor_match": vendor_match,
+                "reasons": mismatch_reasons
+            }
+        },
+        {
+            "3way_match": {
+                "status": status
+            }
+        }
+    )
+
+@activity.defn
+@log_activity(display_name="06_DECISION")
 async def approval_decision(input: ActivityInput) -> ActivityOutput:
     # Decide if invoice is auto-approved or requires manual review
     total = input.payload.get("invoice_data", {}).get("invoice_total", 0)
@@ -230,7 +317,7 @@ async def approval_decision(input: ActivityInput) -> ActivityOutput:
     )
 
 @activity.defn
-@log_activity(display_name="06_ERP")
+@log_activity(display_name="07_ERP")
 async def post_to_erp(input: ActivityInput) -> ActivityOutput:
     # Post approved invoice to ERP system
     erp_id = f"ERP-{uuid.uuid4().hex[:8]}"
@@ -255,7 +342,7 @@ async def post_to_erp(input: ActivityInput) -> ActivityOutput:
     )
 
 @activity.defn
-@log_activity(display_name="07_NOTIFY")
+@log_activity(display_name="08_NOTIFY")
 async def send_rejection_notification(input: ActivityInput) -> ActivityOutput:
     # Notify relevant parties on rejection
     return ActivityOutput(
@@ -264,7 +351,7 @@ async def send_rejection_notification(input: ActivityInput) -> ActivityOutput:
     )
 
 @activity.defn
-@log_activity(display_name="08_AUDIT")
+@log_activity(display_name="09_AUDIT")
 async def store_audit(input: ActivityInput) -> ActivityOutput:
     # Log final results for audit
     print(json.dumps(input.payload, indent=2))
@@ -305,16 +392,29 @@ class InvoiceProcessingWorkflow:
         inv_context = merge_context(context, {"item_id": inv["item_id"], "doc_type": inv.get("doc_type")})
 
         # OCR extraction
-        inv_payload, inv_context = await execute_step(ai_process_doc, inv_payload, inv_context, "02_OCR", 120)
+        inv_payload, inv_context = await execute_step(
+            ai_process_doc, inv_payload, inv_context, "02_OCR", 120
+        )
 
         # Normalize document fields
-        inv_payload, inv_context = await execute_step(normalize_document, inv_payload, inv_context, "03_NORMALIZE")
+        inv_payload, inv_context = await execute_step(
+            normalize_document, inv_payload, inv_context, "03_NORMALIZE"
+        )
 
-        # Validate invoice data
-        inv_payload, inv_context = await execute_step(validate_document, inv_payload, inv_context, "04_VALIDATE")
+        # Basic validation (schema + thresholds)
+        inv_payload, inv_context = await execute_step(
+            validate_document, inv_payload, inv_context, "04_VALIDATE"
+        )
 
-        # Make approval decision
-        inv_payload, inv_context = await execute_step(approval_decision, inv_payload, inv_context, "05_DECISION")
+        # 3-way matching (PO / GR / Invoice)
+        inv_payload, inv_context = await execute_step(
+            financial_matching_3way, inv_payload, inv_context, "05_3WAY_MATCHING"
+        )
+
+        # Approval decision
+        inv_payload, inv_context = await execute_step(
+            approval_decision, inv_payload, inv_context, "06_DECISION"
+        )
         decision = inv_payload.get("approval_decision")
 
         # Log task summary for approver (auto or pending manual)
@@ -427,6 +527,7 @@ async def main():
             pre_process_invoices,
             ai_process_doc,
             normalize_document,
+            financial_matching_3way,
             validate_document,
             approval_decision,
             post_to_erp,

@@ -177,7 +177,7 @@ def get_latest_ocr_by_item(item_id: int):
         SELECT extracted_fields, status
         FROM workflow_ocr_data
         WHERE item_id = %s
-        ORDER BY version DESC
+        ORDER BY created_at DESC
         LIMIT 1
     """
     with get_conn() as conn, conn.cursor() as cur:
@@ -400,6 +400,96 @@ def get_workflow_graph_data(workflow_id: str):
 
     return { "workflow": workflow, "activities": activities }
 
+def delete_workflow(workflow_id: str):
+    """
+    Delete workflow instance and all related records.
+    """
+
+    with get_conn() as conn, conn.cursor() as cur:
+
+        # -------------------------------------------------
+        # Validate workflow exists
+        # -------------------------------------------------
+        cur.execute("""
+            SELECT workflow_id
+            FROM workflow_instance
+            WHERE workflow_id = %s
+        """, (workflow_id,))
+
+        workflow = fetch_one(cur)
+
+        if not workflow:
+            return None
+
+        # -------------------------------------------------
+        # Delete activity logs
+        # -------------------------------------------------
+        cur.execute("""
+            DELETE FROM workflow_activity_instance
+            WHERE workflow_id = %s
+               OR child_workflow_id = %s
+        """, (workflow_id, workflow_id))
+
+        activity_deleted = cur.rowcount
+
+        # -------------------------------------------------
+        # Delete approval tasks
+        # -------------------------------------------------
+        cur.execute("""
+            DELETE FROM workflow_approval_task
+            WHERE workflow_id = %s
+        """, (workflow_id,))
+
+        approval_deleted = cur.rowcount
+
+        # -------------------------------------------------
+        # Delete OCR data
+        # -------------------------------------------------
+        cur.execute("""
+            DELETE FROM workflow_ocr_data
+            WHERE workflow_id = %s
+        """, (workflow_id,))
+
+        ocr_deleted = cur.rowcount
+
+        # -------------------------------------------------
+        # Delete ERP/CRM documents
+        # -------------------------------------------------
+        cur.execute("""
+            DELETE FROM erp_crm_documents
+            WHERE workflow_id = %s
+               OR child_workflow_id = %s
+        """, (workflow_id, workflow_id))
+
+        documents_deleted = cur.rowcount
+
+        # -------------------------------------------------
+        # Delete workflow instance
+        # -------------------------------------------------
+        cur.execute("""
+            DELETE FROM workflow_instance
+            WHERE workflow_id = %s
+        """, (workflow_id,))
+
+        workflow_deleted = cur.rowcount
+
+        # -------------------------------------------------
+        # Commit transaction
+        # -------------------------------------------------
+        conn.commit()
+
+    return {
+        "success": True,
+        "workflow_id": workflow_id,
+        "deleted": {
+            "workflow_instance": workflow_deleted,
+            "workflow_activity_instance": activity_deleted,
+            "workflow_approval_task": approval_deleted,
+            "workflow_ocr_data": ocr_deleted,
+            "erp_crm_documents": documents_deleted
+        }
+    }
+
 # ------------------------------------------------
 # Workflow Logging
 # ------------------------------------------------
@@ -427,3 +517,58 @@ def log_workflow_signal(workflow_id: str, signal_name: str, signal_input: Dict[s
         logger.error(f"❌ log_workflow_signal failed: {e}")
         raise
 
+# =========================================================
+# DB FUNCTION
+# Delete process header + all items only
+# =========================================================
+def delete_process_header(header_id: int):
+    """
+    Delete process header and all related items.
+    """
+
+    with get_conn() as conn, conn.cursor() as cur:
+
+        # -------------------------------------------------
+        # Validate header exists
+        # -------------------------------------------------
+        cur.execute("""
+            SELECT id
+            FROM automation_process_header
+            WHERE id = %s
+        """, (header_id,))
+
+        header = fetch_one(cur)
+
+        if not header:
+            return None
+
+        # -------------------------------------------------
+        # Delete items
+        # -------------------------------------------------
+        cur.execute("""
+            DELETE FROM automation_process_item
+            WHERE header_id = %s
+        """, (header_id,))
+
+        items_deleted = cur.rowcount
+
+        # -------------------------------------------------
+        # Delete header
+        # -------------------------------------------------
+        cur.execute("""
+            DELETE FROM automation_process_header
+            WHERE id = %s
+        """, (header_id,))
+
+        header_deleted = cur.rowcount
+
+        conn.commit()
+
+    return {
+        "success": True,
+        "header_id": header_id,
+        "deleted": {
+            "automation_process_item": items_deleted,
+            "automation_process_header": header_deleted
+        }
+    }

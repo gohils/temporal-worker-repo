@@ -9,6 +9,7 @@ from openai import OpenAI
 
 # Import DB abstraction layer
 import wf_ai_fastapi.routers.process_db as db
+import wf_ai_fastapi.routers.bpm_prompts as bpm_prompts
 
 # ---------------------------
 # Environment Validation
@@ -161,108 +162,11 @@ def build_snapshot(header_id: int):
 # =========================================================
 # SYSTEM PROMPT (STRICT ENGINE)
 # =========================================================
-# =========================================================
-# 🔥 LLM PROMPT (STRICT, NO FLUFF)
-# =========================================================
-SYSTEM_PROMPT = """
-You are a business transaction status engine.
-
-You must produce BOTH:
-1. Structured JSON (for system use)
-2. Human-readable summary (for business user)
-
-STRICT RULES:
-- Always include transaction id
-- Always include key business fields (vendor, amount if available)
-- Never invent data
-- Never output generic explanations
-- Human output must be structured, concise, and scannable
-
-OUTPUT MUST BE VALID JSON ONLY.
-
-OUTPUT FORMAT:
-
-{
-  "structured": {
-    "transaction": "...",
-    "lifecycle_position": "...",   // STEP (STATUS, DECISION if exists)
-    "path": "...",
-    "status_map": {},              // MUST be object, not string
-    "completed_steps": [],
-    "blocking_step": null,
-    "waiting_for": null,
-    "next_action": "...",
-    "confidence_note": "..."
-  },
-  "human_readable": "MULTI-LINE TEXT"
-}
-"""
-
-def build_prompt(snapshot: Dict[str, Any]):
-
-    return f"""
-ACTION: where_in_lifecycle
-
-INPUT SNAPSHOT:
-{json.dumps(snapshot, indent=2)}
-
-INSTRUCTIONS:
-
-1. Determine lifecycle position:
-   Combine step + status + decision
-   Example: ERP_POST (COMPLETED, MANUAL_APPROVED)
-
-2. Build execution path:
-   Invoice: PREPROCESS → OCR → NORMALIZE → VALIDATE → APPROVAL → ERP_POST  
-   KYC: PREPROCESS → OCR → VALIDATE → APPROVAL → ERP
-
-3. Build status_map:
-   ✓ = completed
-   ⏳ = in progress
-   ⬜ = not started
-
-4. completed_steps (ONLY if evidence exists):
-   - OCR → OCR_COMPLETE
-   - validation passed → VALIDATION_PASSED
-   - approval decision → APPROVED
-   - ERP exists → ERP_POSTED
-
-5. blocking logic:
-   - approval pending → DOCUMENT_APPROVAL
-   - validation failure → VALIDATE
-   - else null
-
-6. waiting_for:
-   - manual approval → assigned_to
-   - else null
-
-7. next_action: (provide one of the following based on lifecycle position completed_steps and blocking logic)
-   - start workflow if not started → "Start workflow"
-   - approval pending → "Review approval queue"
-   - completed → "No action required"
-   - failed → "Fix validation issue"
-
-8. confidence_note:
-   MUST reference real signals (approval, ERP, validation)
-
-9. HUMAN Readable Business Summary GUIDELINES:
-Include following with less than 3 sentences only with following key insights:
-- Lifecycle Status with key data points (transaction + vendor + amount + position etc.)
-- Completed Steps (only evidence-backed)
-- Current Status (blocking or completed)
-
-STYLE:
-- Business tone writing communicating key insights to a business user
-- No JSON-like formatting
-
-Keep concise. No paragraphs. No fluff.
-"""
 
 # =========================================================
 # LLM CALL
 # =========================================================
-
-def run_llm(prompt: str, model: str = "gpt-4o-mini"):
+def run_llm(system_prompt: str, user_prompt: str, model: str = "gpt-4o-mini"):
 
     client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
@@ -270,8 +174,8 @@ def run_llm(prompt: str, model: str = "gpt-4o-mini"):
         model=model,
         temperature=0,
         messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": prompt},
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
         ],
     )
 
@@ -280,11 +184,7 @@ def run_llm(prompt: str, model: str = "gpt-4o-mini"):
     try:
         return json.loads(raw)
     except:
-        return {
-            "error": "invalid_json",
-            "raw": raw
-        }
-
+        return {"error": "invalid_json", "raw": raw}
 
 # =========================================================
 # MAIN ROUTER
@@ -292,7 +192,7 @@ def run_llm(prompt: str, model: str = "gpt-4o-mini"):
 @router.post("/ai-reasoning", response_model=AIResponse)
 async def ai_reasoning(req: AIRequest):
     """Endpoint for AI reasoning on documents with action-aware context building and unified prompt transformation.
-            where_in_lifecycle, is_everything_correct, needs_attention, root_cause, what_next
+            where_in_lifecycle, approval_assistant, root_cause
     ```json
     {
         "action": "where_in_lifecycle",
@@ -304,29 +204,40 @@ async def ai_reasoning(req: AIRequest):
     }
     ```
     """
+
     try:
         header_id = req.context.get("headerId")
 
         if not header_id:
             raise HTTPException(status_code=400, detail="headerId is required")
 
-        # 1. Build deterministic snapshot
+        # 1. Snapshot (deterministic layer)
         snapshot = build_snapshot(header_id)
 
-        # 2. Build prompt
-        prompt = build_prompt(snapshot)
+        # 2. Action selection (central AI routing logic)
+        action = req.action
 
-        # 3. Call LLM
-        model = req.options.get("model", "gpt-4o-mini") if req.options else "gpt-4o-mini"
-        result = run_llm(prompt, model)
+        # 3. Get prompts from bpm_prompts (single source of truth)
+        system_prompt = bpm_prompts.get_system_prompt(action)
+        user_prompt = bpm_prompts.build_prompt(action, snapshot)
 
-        # 4. Extract confidence safely
+        # 4. Model selection
+        model = (
+            req.options.get("model", "gpt-4o-mini")
+            if req.options else "gpt-4o-mini"
+        )
+
+        # 5. LLM execution (clean separation)
+        result = run_llm(system_prompt, user_prompt, model)
+        print(f"LLM RAW RESPONSE: {result}")
+
+        # 6. Extract confidence safely
         confidence = None
         if isinstance(result, dict):
             confidence = result.get("structured", {}).get("confidence")
 
         return AIResponse(
-            action=req.action,
+            action=action,
             transaction=snapshot["transaction"],
             result=result,
             confidence=confidence
