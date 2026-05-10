@@ -32,12 +32,13 @@ AI_API_URL = os.getenv("AI_API_URL", "https://zdoc-ai-api.azurewebsites.net")  #
 # Approval logging helper
 # -----------------------------
 def log_wf_approval(
-    wf_id, wf_type,header_id,item_id, status, signal_name=None, decision=None,
-    role=None, user=None, comments=None, additional_data=None
+    wf_id, wf_type,reference_id,header_id,item_id, status, signal_name=None, decision=None,
+    role=None, user=None, task_approval_summary=None, comments=None, additional_data=None
 ):
     log_approval_signal(
         workflow_id=wf_id,
         workflow_type=wf_type,
+        reference_id=reference_id,
         header_id=header_id,
         item_id=item_id,
         task_name="DOCUMENT_APPROVAL",
@@ -49,6 +50,7 @@ def log_wf_approval(
         decision=decision,
         comments=comments,
         additional_data=additional_data,
+        task_approval_summary=task_approval_summary
     )
     print(f"📝 [APPROVAL LOGGED] status={status}, decision={decision}, role={role}, user={user}")
 
@@ -283,7 +285,33 @@ async def validate_document(input: ActivityInput) -> ActivityOutput:
 @log_activity(display_name="05_CROSS_VERIFY", activity_group="VALIDATION")
 async def cross_document_verification(input: ActivityInput) -> ActivityOutput:
     """Stub for cross-document verification"""
-    return ActivityOutput({"status": "valid"}, {})  # placeholder
+    docs = input.payload.get("documents", [])
+    passport = next((d for d in docs if d.get("doc_type") == "passport"), None)
+    license = next((d for d in docs if d.get("doc_type") == "driving_licence"), None)
+    utility_bill = next((d for d in docs if d.get("doc_type") == "utility_bill"), None)
+
+    missing = []
+
+    # if not license:
+    #     missing.append("driving_licence")
+
+    # if not passport:
+    #     missing.append("passport")
+
+    # if not utility_bill:
+    #     missing.append("proof_of_address")
+
+
+    cross_verification_decision = "AUTO_APPROVED" if not missing else "MANUAL_REVIEW"
+
+    return ActivityOutput(
+        {   "decision": cross_verification_decision,
+            "missing_documents": missing,
+            "documents": docs
+        },
+        {}
+    )
+
 
 @activity.defn
 @log_activity(display_name="06_ERP_POST", activity_group="ERP")
@@ -322,7 +350,8 @@ async def store_audit(input: ActivityInput) -> ActivityOutput:
     """Store workflow audit logs"""
     print(json.dumps(input.payload, indent=2))  # print audit log
     return ActivityOutput({"status": "stored"}, {})  # confirm audit
-
+# -----------------------------
+# Add a human-readable formatter for KYC summary
 @activity.defn
 @log_activity(display_name="approval_decision")
 async def approval_decision(input: ActivityInput) -> ActivityOutput:
@@ -330,21 +359,54 @@ async def approval_decision(input: ActivityInput) -> ActivityOutput:
     wf_id = input.context.get("workflow_id")
     wf_type = input.context.get("workflow_type")
     header_id = input.context.get("header_id")
+    reference_id = input.context.get("reference_id")
+    decision = input.payload.get("decision", "REVIEW_REQUIRED")
+    docs = input.payload.get("documents", [])
+    missing = input.payload.get("missing_documents", [])
 
-    decision = "AUTO_APPROVED" if input.payload.get("status", "").upper() == "VALID" else "REVIEW"
+    summary = {
+        "documents": [
+            {
+                "document_type": d.get("doc_type"),
+                "status": d.get("document_validation_status"),
+                "confidence": d.get("summary", {}).get("confidence", 0),
+            }
+            for d in docs
+        ],
+        "overall_status": decision,
+        "missing_documents": missing
+    }
+
+    documents_summary = [
+        f"{d.get('doc_type', 'Unknown')} was {d.get('document_validation_status', 'UNKNOWN')}"
+        for d in docs
+    ]
+
+    documents_text = ". ".join(documents_summary)
+
+    documents_sentence = (
+        f"{documents_text}. "
+        f"Total {len(docs)} document(s) were evaluated for this request {reference_id}."
+    )
+
+    task_summary = {
+        "overall_decision": decision,
+        "documents_received": len(docs),
+        "document_verification": documents_sentence
+    }
 
     if decision == "AUTO_APPROVED":
         log_wf_approval(
-            wf_id=wf_id, wf_type=wf_type, header_id=header_id, item_id=None, status="COMPLETED", signal_name="SYSTEM",
+            wf_id=wf_id, wf_type=wf_type, reference_id=input.context.get("reference_id"), header_id=header_id, item_id=None, status="COMPLETED", signal_name="SYSTEM",
             decision="AUTO_APPROVED", role="SYSTEM", user="SYSTEM",
-            comments="Document-Validation-Auto-approved"
+            comments="auto-approved", additional_data=summary, task_approval_summary=task_summary
         )
         print(f"✅ [APPROVAL DECISION] document {header_id} auto-approved")
     else:
         log_wf_approval(
-            wf_id=wf_id, wf_type=wf_type, header_id=header_id, item_id=None, status="PENDING", signal_name="manual_approval",
+            wf_id=wf_id, wf_type=wf_type, reference_id=input.context.get("reference_id"),header_id=header_id, item_id=None, status="PENDING", signal_name="manual_approval",
             decision=None, role="MANAGER", user=None,
-            comments="Waiting for manual approval"
+            comments="manual review required", additional_data=summary, task_approval_summary=task_summary
         )
         print(f"⏳ [APPROVAL DECISION] document {header_id} requires manual review")
 
@@ -395,8 +457,19 @@ class DocumentWorkflow:
         except Exception as e:
             result["errors"].append(str(e))
 
-        return result
-
+        return {
+            "doc_type": result["doc_type"],
+            "document_validation_status": result["validation"],
+            "ocr_data": result["ocr_data"],
+            "erp_id": result.get("erp_id"),
+            "summary": {
+                "document_type": result["doc_type"],
+                "document_validation_status": result["validation"],
+                "confidence": result.get("confidence", 0),
+                "key_fields": result.get("ocr_data", {}).get("extracted_fields", {}) if result.get("ocr_data") else {},
+            }
+        }
+    
 # -----------------------------
 # Parent Workflow
 # -----------------------------
@@ -440,19 +513,32 @@ class CustomerOnboardingWorkflow:
             )
             child_handles.append(handle)
 
+        # Aggregate result in parent workflow
         results = [await h for h in child_handles]  # collect results
+        aggregated_summary = {
+            "passport": None,
+            "driving_licence": None,
+            "utility_bill": None,
+        }
+
+        for r in results:
+            doc_type = r.get("doc_type")
+
+            if doc_type:
+                key = doc_type.lower().replace(" ", "_")
+                aggregated_summary[key] = r
 
         # Step 3: cross verification
         cross_payload, context = await execute_step(
             cross_document_verification, {"documents": results}, context, "05_CROSS_VERIFY"
         )
 
-        decision = "AUTO_APPROVED" if cross_payload.get("status") == "valid" else "REVIEW"
+        final_decision = cross_payload.get("decision")
 
         # Step 4: log approval decision
         cross_payload, context = await execute_step(
             approval_decision,
-            {"documents": cross_payload.get("documents"), "status": cross_payload.get("status")},
+            {"documents": cross_payload.get("documents"), "decision": cross_payload.get("decision"), "missing_documents": cross_payload.get("missing_documents")},
             context,
             "08_APPROVAL_DECISION",
         )
@@ -463,8 +549,7 @@ class CustomerOnboardingWorkflow:
             {
                 "workflow_id": wf_id,
                 "documents": results,
-                "decision": decision,
-                "approvals": [r.get("approval_decision") for r in results],
+                "decision": final_decision,
             },
             context,
             "07_AUDIT",
@@ -481,7 +566,7 @@ class CustomerOnboardingWorkflow:
         )
 
         erp_ids = [r.get("erp_id") for r in results if r.get("erp_id")]
-        return {"status": "COMPLETED", "decision": decision, "erp_ids": erp_ids}
+        return {"status": "COMPLETED", "decision": final_decision, "erp_ids": erp_ids}
 
 # -----------------------------
 # Worker
