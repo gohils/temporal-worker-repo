@@ -6,6 +6,8 @@ import json
 from azure.core.credentials import AzureKeyCredential
 from azure.ai.formrecognizer import DocumentAnalysisClient
 from openai import OpenAI
+import requests
+import io
 
 # Import DB abstraction layer
 from wf_ai_fastapi.routers import bpm_prompts
@@ -44,17 +46,6 @@ class AIClients:
             )
         return cls._llm_client
 
-    @classmethod
-    def doc_ai(cls):
-        if cls._doc_client is None:
-            cls._doc_client = DocumentAnalysisClient(
-                endpoint=os.getenv("AZURE_DOC_INT_API_ENDPOINT"),
-                credential=AzureKeyCredential(
-                    os.getenv("AZURE_DOC_INT_API_KEY")
-                )
-            )
-        return cls._doc_client
-
 # =========================================================
 # REQUEST / RESPONSE
 # =========================================================
@@ -70,6 +61,11 @@ class AIResponse(BaseModel):
     result: Dict[str, Any]
     raw_response: Optional[str] = None
     confidence: Optional[float] = None
+
+class TranscribeRequest(BaseModel):
+    audio_url: str
+    workflow_id: Optional[str] = None
+    call_id: Optional[str] = None
 
 BUSINESS_SUMMARY_PROMPT = """
 You are a business operations assistant.
@@ -144,81 +140,203 @@ async def ai_reasoning(req: AIRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     
-# ---------------------------
-# OCR Request Model
-# ---------------------------
-class AnalyzeRequest(BaseModel):
-    ai_model_name: str = "prebuilt-read"
-    document_url: str = "https://zblobarchive.blob.core.windows.net/samples/aus-passport-sample1.png"
-    response_format: str = "plain_text"
 
-# ---------------------------
-# Extraction Helpers
-# ---------------------------
-def extract_plain_text(result):
-    return "\n\n".join(
-        "\n".join(line.content for line in page.lines) for page in result.pages
+# =========================================================
+# 1. TRANSCRIPT ANALYSIS
+# =========================================================
+@router.post("/analyze-transcript")
+async def analyze_transcript(req: AIRequest):
+
+    prompt = f"""
+    Analyze this call transcript:
+
+    {req.context.get("transcript")}
+
+    Return structured JSON with:
+    - summary
+    - intent
+    - entities
+    - key_moments
+    """
+
+    response = AIClients.llm().chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0
     )
 
-def extract_flat_fields(result):
-    docs = []
-    for doc in result.documents:
-        data = {}
-        for k, f in (doc.fields or {}).items():
-            data[k] = (
-                getattr(f, "value_string", None)
-                or str(getattr(f, "value_date", None))
-                or getattr(f, "value_number", None)
-                or getattr(getattr(f, "value_currency", None), "amount", None)
-                or getattr(f, "content", None)
-            )
-        docs.append(data)
-    return docs
+    return json.loads(response.choices[0].message.content)
 
-def extract_structured(result):
-    docs = []
-    for doc in result.documents:
-        header, items = {}, []
-        for k, f in doc.fields.items():
-            if k.lower() != "items" and hasattr(f, "content"):
-                header[k] = f.content
-        items_field = doc.fields.get("Items")
-        if items_field and hasattr(items_field, "value"):
-            for item in items_field.value:
-                items.append({k: getattr(v, "content", None) for k, v in item.value.items()})
-        docs.append({"header": header, "items": items})
-    return docs
 
-# ---------------------------
-# OCR Endpoint
-# ---------------------------
-@router.post("/analyze-document-prebuilt-model")
-async def analyze_document(request: AnalyzeRequest):
-    """Endpoint to analyze document using specified prebuilt model
-       \nai_model_name : prebuilt-read, prebuilt-layout, prebuilt-idDocument, prebuilt-invoice, prebuilt-receipt
-      \n return format : plain_text, flat, structured (in header-item format).
+# =========================================================
+# 2. CHURN PREDICTION
+# =========================================================
+@router.post("/churn-prediction")
+async def churn_prediction(req: AIRequest):
+
+    prompt = f"""
+    Predict churn risk (0 to 1) and reasons:
+
+    {req.context.get("transcript")}
+
+    Return JSON:
+    {{
+      "churn_score": float,
+      "risk_factors": [],
+      "confidence": float
+    }}
     """
+
+    response = AIClients.llm().chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0
+    )
+
+    return json.loads(response.choices[0].message.content)
+
+
+# =========================================================
+# 3. REVENUE OPPORTUNITY ENGINE
+# =========================================================
+@router.post("/revenue-opportunity")
+async def revenue_opportunity(req: AIRequest):
+
+    prompt = f"""
+    Extract upsell and cross-sell opportunities:
+
+    {req.context.get("transcript")}
+
+    Return JSON:
+    {{
+      "upsell": [],
+      "cross_sell": [],
+      "intent_strength": float
+    }}
+    """
+
+    response = AIClients.llm().chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0
+    )
+
+    return json.loads(response.choices[0].message.content)
+
+
+# =========================================================
+# 4. CALL INTELLIGENCE SUMMARY (MASTER)
+# =========================================================
+@router.post("/call-intelligence-summary")
+async def call_intelligence_summary(req: AIRequest):
+
+    prompt = f"""
+    Create unified call intelligence:
+
+    {req.context.get("transcript")}
+
+    Return JSON:
+    {{
+      "call_summary": "",
+      "customer_sentiment": "",
+      "churn_risk": float,
+      "revenue_opportunity": "",
+      "recommended_action": ""
+    }}
+    """
+
+    response = AIClients.llm().chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0
+    )
+
+    return json.loads(response.choices[0].message.content)
+
+
+# =========================================================
+# 5. SALESFORCE PAYLOAD GENERATOR
+# =========================================================
+@router.post("/generate-salesforce-payload")
+async def generate_salesforce_payload(req: AIRequest):
+
+    prompt = f"""
+    Convert this call intelligence into CRM payload for Salesforce:
+
+    {req.context.get("structured_data")}
+
+    Return JSON formatted for CRM ingestion.
+    """
+
+    response = AIClients.llm().chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0
+    )
+
+    return json.loads(response.choices[0].message.content)
+
+@router.post("/transcribe-audio")
+async def transcribe_audio(req: TranscribeRequest):
+    """
+    Stateless transcription endpoint.
+    Input:
+    {  "audio_url": "https://zblobarchive.blob.core.windows.net/samples/call_cancellation_chat_sample1.wav"     }
+    """
+
+    audio_url = req.audio_url
+
+    if not audio_url:
+        raise HTTPException(status_code=400, detail="audio_url is required")
+
     try:
-        poller = AIClients.doc_ai().begin_analyze_document_from_url(
-            model_id=request.ai_model_name,
-            document_url=request.document_url
+        # -------------------------------------------------
+        # 1. Download audio into memory (NO DISK)
+        # -------------------------------------------------
+        response = requests.get(audio_url, timeout=30)
+        response.raise_for_status()
+
+        audio_bytes = io.BytesIO(response.content)
+        audio_bytes.name = "audio.wav"  # required by OpenAI SDK
+
+        # -------------------------------------------------
+        # 2. Whisper transcription
+        # -------------------------------------------------
+        client = AIClients.llm()
+
+        transcript_response = client.audio.transcriptions.create(
+            model="whisper-1",
+            file=audio_bytes
         )
-        result = poller.result()
 
-        if request.response_format == "plain_text":
-            extracted = extract_plain_text(result)
-        elif request.response_format == "flat":
-            extracted = extract_flat_fields(result)
-        elif request.response_format == "structured":
-            extracted = extract_structured(result)
-        else:
-            raise HTTPException(400, "Invalid response_format")
+        transcript = transcript_response.text
 
+        print("Transcription result:", transcript)
+
+        if not transcript:
+            raise HTTPException(
+                status_code=500,
+                detail="Transcription failed"
+            )
+
+        # -------------------------------------------------
+        # 3. Return result (stateless)
+        # -------------------------------------------------
         return {
-            "model_used": request.ai_model_name,
-            "response_format": request.response_format,
-            "documents": extracted
+            "audio_url": audio_url,
+            "transcript": transcript,
+            "workflow_id": req.workflow_id,
+            "call_id": req.call_id
         }
 
+    except requests.exceptions.RequestException as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Audio download failed: {str(e)}"
+        )
+
     except Exception as e:
-        raise HTTPException(500, str(e))
+        raise HTTPException(
+            status_code=500,
+            detail=f"Transcription error: {str(e)}"
+        )

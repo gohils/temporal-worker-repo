@@ -24,14 +24,15 @@ with workflow.unsafe.imports_passed_through():
         store_erp_document,
         log_approval_signal,
     )
+    from salesforce_dd_utils import (upsert_account_with_direct_debit)
 
 # -----------------------------
 # CONFIG
 # -----------------------------
-TEMPORAL_HOST = os.getenv("TEMPORAL_HOST", "temporal-server-demo.australiaeast.cloudapp.azure.com:7233")
+# TEMPORAL_HOST = os.getenv("TEMPORAL_HOST", "temporal-server-demo.australiaeast.cloudapp.azure.com:7233")
 TASK_QUEUE = os.getenv("TASK_QUEUE", "direct-debit-queue")
 AI_API_URL = os.getenv("AI_API_URL", "https://zdoc-ai-api.azurewebsites.net")
-# TEMPORAL_HOST = "localhost:7233"
+TEMPORAL_HOST = "localhost:7233"
 # TASK_QUEUE = "direct-debit-queue"
 # AI_API_URL = os.getenv("AI_API_URL", "http://localhost:8000")
 
@@ -281,6 +282,7 @@ async def notify(input: ActivityInput) -> ActivityOutput:
         {"notify": {"status": "sent"}}
     )
 
+
 # =========================================================
 # 08 AUDIT
 # =========================================================
@@ -289,6 +291,28 @@ async def notify(input: ActivityInput) -> ActivityOutput:
 async def audit(input: ActivityInput) -> ActivityOutput:
     print(json.dumps(input.payload, indent=2))
     return ActivityOutput({**input.payload, "status": "stored"}, {})
+
+@activity.defn
+@log_activity(display_name="09_SALESFORCE_SYNC", activity_group="SYSTEM")
+async def salesforce_sync(input: ActivityInput) -> ActivityOutput:
+
+    header_id = input.context.get("header_id")
+
+    try:
+        result = upsert_account_with_direct_debit(header_id)
+
+        return ActivityOutput(
+            {"status": "SUCCESS", "salesforce_result": result},
+            {"salesforce": {"status": "SUCCESS"}}
+        )
+
+    except Exception as e:
+
+        return ActivityOutput(
+            {"status": "SKIPPED", "reason": str(e)},
+            {"salesforce": {"status": "SKIPPED"}}
+        )
+    
 
 # =========================================================
 # WORKFLOW (FULL PARITY)
@@ -345,8 +369,8 @@ class DirectDebitWorkflow:
             status="PENDING" if decision_val == "manual_review" else "COMPLETED",
             decision="AUTO_APPROVED" if decision_val.startswith("auto") else None,
             task_approval_summary={
-                "account_number": item_payload.get("ocr_data", {}).get("AccountNumber"),
-                "account_name": item_payload.get("ocr_data", {}).get("AccountName"),
+                "Bank_account_number": item_payload.get("ocr_data", {}).get("AccountNumber"),
+                "Bank_account_name": item_payload.get("ocr_data", {}).get("AccountName"),
                 "approval_decision": decision_val
             },
             signal_payload={"source": "SYSTEM"}
@@ -374,7 +398,14 @@ class DirectDebitWorkflow:
 
         results.append({**item_payload, "context": item_context})
 
-        await execute_step(audit, {"results": results}, item_context, "08_AUDIT")
+        item_payload, item_context = await execute_step(audit, {"results": results}, item_context, "08_AUDIT")
+
+        item_payload, item_context = await execute_step(
+            salesforce_sync,
+            {"documents": results},
+            item_context,
+            "09_SALESFORCE_SYNC"
+        )
 
         upsert_workflow_instance(
             workflow_id=wf_id,
@@ -408,6 +439,7 @@ async def main():
             create_mandate,
             notify,
             audit,
+            salesforce_sync
         ],
     )
 

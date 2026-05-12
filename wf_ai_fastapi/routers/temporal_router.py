@@ -282,7 +282,7 @@ async def submit_direct_debit(
     lastName: str = Form(...),
     email: str = Form(None),
     phone: str = Form(None),
-    accountNumber: str = Form(...),
+    customerNumber: str = Form(...),
     document: UploadFile = File(...),
 ):
     # -----------------------------
@@ -305,7 +305,7 @@ async def submit_direct_debit(
             "last_name": lastName,
             "email": email,
             "phone": phone,
-            "account_number": accountNumber,
+            "customer_number": customerNumber,
         },
         "verification_status": "PROCESSING",
         "additional_data": {
@@ -341,6 +341,107 @@ async def submit_direct_debit(
             "document_url": file_url
         },
         "message": "Direct Debit Request submitted successfully. Use reference_id to track status."
+    }
+
+@router.post("/customer-call/submit")
+async def submit_customer_call(
+    request: Request,
+    firstName: str = Form(...),
+    lastName: str = Form(...),
+    email: str = Form(None),
+    phone: str = Form(None),
+
+    # business identifiers
+    customerNumber: str = Form(...),
+    customerCallRecordId: str = Form(...),
+
+    # uploaded audio file
+    audio_file: UploadFile = File(...),
+):
+    # -----------------------------
+    # 1. Generate Reference ID
+    # -----------------------------
+    today = datetime.now().strftime("%Y%m%d")
+    short_uuid = str(uuid.uuid4().hex[:6]).upper()
+
+    reference_id = f"CALL-{today}-{short_uuid}"
+
+    # -----------------------------
+    # 2. Create Process Header
+    # -----------------------------
+    header_id = db.create_process_header({
+        "reference_id": reference_id,
+        "workflow_type": "CustomerCallWorkflow",
+        "process_name": "CustomerCall",
+        "process_group": "CustomerService",
+
+        "declared_data": {
+            "first_name": firstName,
+            "last_name": lastName,
+            "email": email,
+            "phone": phone,
+
+            # customer linkage
+            "customer_number": customerNumber,
+
+            # external call tracking id
+            "customer_call_record_id": customerCallRecordId,
+        },
+
+        "verification_status": "PROCESSING",
+
+        "additional_data": {
+            "submission_source": "customer_call_portal",
+            "channel": "VOICE",
+        }
+    })
+
+    # -----------------------------
+    # 3. Upload Customer Call Audio
+    # -----------------------------
+    file_url = upload_file_to_cloud(audio_file)
+
+    item_id = db.create_process_item({
+        "header_id": header_id,
+
+        # audio conversation type
+        "doc_type": "customer_call_audio",
+
+        "document_url": file_url,
+
+        "declared_data": {
+            "document_type": "customer_call_audio",
+            "audio_format": audio_file.content_type,
+            "customer_call_record_id": customerCallRecordId,
+        },
+
+        "status": "PROCESSING",
+        "is_active": True
+    })
+
+    # -----------------------------
+    # 4. Response to UI
+    # -----------------------------
+    return {
+        "reference_id": reference_id,
+        "header_id": header_id,
+        "item_id": item_id,
+
+        "customer": {
+            "customer_number": customerNumber,
+            "customer_call_record_id": customerCallRecordId,
+        },
+
+        "audio": {
+            "doc_type": "customer_call_audio",
+            "document_url": file_url,
+            "content_type": audio_file.content_type,
+        },
+
+        "message": (
+            "Customer call submitted successfully. "
+            "Use reference_id to track workflow status."
+        )
     }
 
 @router.post("/claims/submit")
@@ -1033,3 +1134,24 @@ def delete_process_header(header_id: int):
         )
 
     return result
+
+# in fastapi router
+@router.post("/start-call-workflow")
+async def start_workflow(payload: dict):
+    """Example payload: {"customer_id": "123", "audio_url": "https://zblobarchive.blob.core.windows.net/samples/call_cancellation_chat_sample1.wav"}
+    """
+    client = await Client.connect("localhost:7233")
+
+    workflow_id = f"CALL-{uuid.uuid4()}"
+
+    handle = await client.start_workflow(
+        "CallCentreAIWorkflow",
+        payload,
+        id=workflow_id,
+        task_queue="call-centre-ai-queue"
+    )
+
+    return {
+        "workflow_id": workflow_id,
+        "run_id": handle.result()
+    }

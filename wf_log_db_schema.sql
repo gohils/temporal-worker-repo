@@ -221,6 +221,35 @@ CREATE TABLE IF NOT EXISTS automation_process_item (
     updated_at TIMESTAMP DEFAULT NOW()
 );
 
+-- =================================================
+-- call_transcripts (for storing audio transcription results, linked to workflows)
+CREATE TABLE IF NOT EXISTS call_transcripts (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+
+    -- Workflow tracking (Temporal)
+    workflow_id VARCHAR(255),
+    call_id VARCHAR(255),
+
+    -- Source audio
+    audio_url TEXT NOT NULL,
+    audio_hash VARCHAR(64),
+
+    -- Transcription output
+    transcript TEXT NOT NULL,
+    transcript_length INTEGER,
+
+    -- Model metadata (important for upgrades)
+    model_name VARCHAR(100) DEFAULT 'whisper-1',
+    model_version VARCHAR(50),
+
+    -- Processing metadata
+    status VARCHAR(50) DEFAULT 'COMPLETED',
+
+    -- Timestamps
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW()
+);
+
 -- =========================================================
 drop table workflow_instance cascade;
 drop table workflow_activity_instance cascade;
@@ -229,3 +258,5 @@ drop table workflow_ocr_data;
 drop table erp_crm_documents;
 drop table automation_process_header;
 drop table automation_process_item;
+
+

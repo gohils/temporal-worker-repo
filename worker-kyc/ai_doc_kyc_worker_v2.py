@@ -22,11 +22,13 @@ with workflow.unsafe.imports_passed_through():
         store_erp_document,
         log_approval_signal,
     )
+    from salesforce_kyc_utils import (upsert_account_with_documents)
 
 # Environment configs
 TEMPORAL_HOST = os.getenv("TEMPORAL_HOST", "temporal-server-demo.australiaeast.cloudapp.azure.com:7233")
 TASK_QUEUE = "kyc-onboarding-queue"
 AI_API_URL = os.getenv("AI_API_URL", "https://zdoc-ai-api.azurewebsites.net")  # AI endpoint
+TEMPORAL_HOST = "localhost:7233"
 
 # -----------------------------
 # Approval logging helper
@@ -350,6 +352,28 @@ async def store_audit(input: ActivityInput) -> ActivityOutput:
     """Store workflow audit logs"""
     print(json.dumps(input.payload, indent=2))  # print audit log
     return ActivityOutput({"status": "stored"}, {})  # confirm audit
+
+@activity.defn
+@log_activity(display_name="09_SALESFORCE_SYNC", activity_group="SYSTEM")
+async def salesforce_sync(input: ActivityInput) -> ActivityOutput:
+
+    header_id = input.context.get("header_id")
+
+    try:
+        result = upsert_account_with_documents(header_id)
+
+        return ActivityOutput(
+            {"status": "SUCCESS", "salesforce_result": result},
+            {"salesforce": {"status": "SUCCESS"}}
+        )
+
+    except Exception as e:
+
+        return ActivityOutput(
+            {"status": "SKIPPED", "reason": str(e)},
+            {"salesforce": {"status": "SKIPPED"}}
+        )
+    
 # -----------------------------
 # Add a human-readable formatter for KYC summary
 @activity.defn
@@ -499,7 +523,7 @@ class CustomerOnboardingWorkflow:
                     "item_id": doc.get("item_id"),
                     "child_workflow_id": child_id,
                     "parent_workflow_id": wf_id,
-                    "branch_id": f"DOC_{i}",
+                    "branch_id": doc.get("declared_doc_type"),
                     "execution_path_id": f"{wf_id}:DOC_{i}",
                     "fanout_group_id": f"{wf_id}:01_PREPROCESS",
                 },
@@ -544,7 +568,7 @@ class CustomerOnboardingWorkflow:
         )
 
         # Step 5: audit
-        await execute_step(
+        audit_payload, audit_context = await execute_step(
             store_audit,
             {
                 "workflow_id": wf_id,
@@ -555,6 +579,12 @@ class CustomerOnboardingWorkflow:
             "07_AUDIT",
         )
 
+        await execute_step(
+            salesforce_sync,
+            {"documents": results},
+            audit_context,
+            "09_SALESFORCE_SYNC"
+        )
         # Step 6: mark workflow completed
         upsert_workflow_instance(
             workflow_id=wf_id,
@@ -592,6 +622,7 @@ async def main():
             approval_decision,
             post_to_erp,
             store_audit,
+            salesforce_sync
         ],
     )
 

@@ -167,7 +167,7 @@ def create_process_item(data: Dict[str, Any]) -> int:
 
 def get_items_by_header(header_id: int) -> List[Dict[str, Any]]:
     """Retrieve all items linked to a process header."""
-    query = "SELECT * FROM automation_process_item WHERE header_id=%s"
+    query = "SELECT * FROM automation_process_item WHERE header_id=%s ORDER BY created_at" 
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute(query, (header_id,))
         return fetch_all(cur)
@@ -254,6 +254,7 @@ def list_workflows(status=None, start_date=None, end_date=None):
                start_time, end_time, created_at, updated_at
         FROM workflow_instance
         WHERE 1=1
+        ORDER BY created_at DESC
     """
     params = []
 
@@ -324,6 +325,7 @@ def list_approval_tasks():
     query = """
         SELECT *
         FROM workflow_approval_task
+        ORDER BY created_at DESC
     """
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute(query)
@@ -391,7 +393,7 @@ def get_workflow_graph_data(workflow_id: str):
 
         cur.execute("""
             SELECT activity_id, node_id, step_key,
-                display_name, status, prev_node_id, branch_id
+                display_name, status, prev_node_id, branch_id, child_workflow_id
             FROM workflow_activity_instance
             WHERE workflow_id = %s
             ORDER BY start_time ASC
