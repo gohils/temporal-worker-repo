@@ -260,14 +260,14 @@ def log_activity(display_name: str,  activity_type: str = "SystemIntegration", a
             try:
                 result = await func(*args, **kwargs)
                 end_time = datetime.utcnow()
-
+                output_data = result.response if hasattr(result, "response") else (result or {})
                 # -----------------------------
                 # SUCCESS EVENT
                 # -----------------------------
                 upsert_activity_event({
                     **base_event,
                     "status": "COMPLETED",
-                    "output_data": getattr(result, "response", None),
+                    "output_data": output_data,
                     "end_time": end_time,
                     "duration_ms": int((end_time - start_time).total_seconds() * 1000)
                 })

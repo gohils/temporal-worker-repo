@@ -8,10 +8,12 @@ from azure.ai.formrecognizer import DocumentAnalysisClient
 from openai import OpenAI
 import requests
 import io
+from datetime import datetime
 
 # Import DB abstraction layer
 from wf_ai_fastapi.routers import bpm_prompts
 import wf_ai_fastapi.routers.process_db as db
+from wf_ai_fastapi.routers import ai_cc_salesforce_prompt
 
 # ---------------------------
 # Environment Validation
@@ -49,23 +51,35 @@ class AIClients:
 # =========================================================
 # REQUEST / RESPONSE
 # =========================================================
-class AIRequest(BaseModel):
+class AIReasoningRequest(BaseModel):
     action: str
     context: Dict[str, Any] = Field(default_factory=dict)
     options: Optional[Dict[str, Any]] = Field(default_factory=dict)
 
 
-class AIResponse(BaseModel):
+class AIReasoningResponse(BaseModel):
     action: str
     final_prompt: str
     result: Dict[str, Any]
     raw_response: Optional[str] = None
     confidence: Optional[float] = None
 
+
 class TranscribeRequest(BaseModel):
     audio_url: str
     workflow_id: Optional[str] = None
     call_id: Optional[str] = None
+
+class IntentAIRequest(BaseModel):
+    system_prompt: str
+    user_prompt: str
+    context: Dict[str, Any] = Field(default_factory=dict)
+    options: Optional[Dict[str, Any]] = Field(default_factory=dict)
+
+class AIIntentResponse(BaseModel):
+    result: Dict[str, Any]
+    model: str
+    confidence: Optional[float] = None
 
 BUSINESS_SUMMARY_PROMPT = """
 You are a business operations assistant.
@@ -89,8 +103,8 @@ A short business-friendly summary.
 # ---------------------------
 # LLM AI reasoning Endpoint
 # ---------------------------
-@router.post("/ai-reasoning", response_model=AIResponse)
-async def ai_reasoning(req: AIRequest):
+@router.post("/ai-reasoning", response_model=AIReasoningResponse)
+async def ai_reasoning(req: AIReasoningRequest):
     """Endpoint for AI reasoning on documents with action-aware context building and unified prompt transformation.
             where_in_lifecycle, is_everything_correct, needs_attention, root_cause, what_next
     ```json
@@ -129,7 +143,7 @@ async def ai_reasoning(req: AIRequest):
         except:
             parsed = {"error": "invalid_json", "raw_response": raw}
 
-        return AIResponse(
+        return AIReasoningResponse(
             action=req.action,
             final_prompt=final_prompt,
             result=parsed,
@@ -140,141 +154,6 @@ async def ai_reasoning(req: AIRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     
-
-# =========================================================
-# 1. TRANSCRIPT ANALYSIS
-# =========================================================
-@router.post("/analyze-transcript")
-async def analyze_transcript(req: AIRequest):
-
-    prompt = f"""
-    Analyze this call transcript:
-
-    {req.context.get("transcript")}
-
-    Return structured JSON with:
-    - summary
-    - intent
-    - entities
-    - key_moments
-    """
-
-    response = AIClients.llm().chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0
-    )
-
-    return json.loads(response.choices[0].message.content)
-
-
-# =========================================================
-# 2. CHURN PREDICTION
-# =========================================================
-@router.post("/churn-prediction")
-async def churn_prediction(req: AIRequest):
-
-    prompt = f"""
-    Predict churn risk (0 to 1) and reasons:
-
-    {req.context.get("transcript")}
-
-    Return JSON:
-    {{
-      "churn_score": float,
-      "risk_factors": [],
-      "confidence": float
-    }}
-    """
-
-    response = AIClients.llm().chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0
-    )
-
-    return json.loads(response.choices[0].message.content)
-
-
-# =========================================================
-# 3. REVENUE OPPORTUNITY ENGINE
-# =========================================================
-@router.post("/revenue-opportunity")
-async def revenue_opportunity(req: AIRequest):
-
-    prompt = f"""
-    Extract upsell and cross-sell opportunities:
-
-    {req.context.get("transcript")}
-
-    Return JSON:
-    {{
-      "upsell": [],
-      "cross_sell": [],
-      "intent_strength": float
-    }}
-    """
-
-    response = AIClients.llm().chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0
-    )
-
-    return json.loads(response.choices[0].message.content)
-
-
-# =========================================================
-# 4. CALL INTELLIGENCE SUMMARY (MASTER)
-# =========================================================
-@router.post("/call-intelligence-summary")
-async def call_intelligence_summary(req: AIRequest):
-
-    prompt = f"""
-    Create unified call intelligence:
-
-    {req.context.get("transcript")}
-
-    Return JSON:
-    {{
-      "call_summary": "",
-      "customer_sentiment": "",
-      "churn_risk": float,
-      "revenue_opportunity": "",
-      "recommended_action": ""
-    }}
-    """
-
-    response = AIClients.llm().chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0
-    )
-
-    return json.loads(response.choices[0].message.content)
-
-
-# =========================================================
-# 5. SALESFORCE PAYLOAD GENERATOR
-# =========================================================
-@router.post("/generate-salesforce-payload")
-async def generate_salesforce_payload(req: AIRequest):
-
-    prompt = f"""
-    Convert this call intelligence into CRM payload for Salesforce:
-
-    {req.context.get("structured_data")}
-
-    Return JSON formatted for CRM ingestion.
-    """
-
-    response = AIClients.llm().chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0
-    )
-
-    return json.loads(response.choices[0].message.content)
 
 @router.post("/transcribe-audio")
 async def transcribe_audio(req: TranscribeRequest):
@@ -340,3 +219,80 @@ async def transcribe_audio(req: TranscribeRequest):
             status_code=500,
             detail=f"Transcription error: {str(e)}"
         )
+    
+
+# =========================================================
+# PROMPT BUILDER
+# =========================================================
+
+def render_prompt(template: str, data: Dict[str, Any]):
+
+    try:
+        return template.format(**data)
+
+    except KeyError as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Missing template variable: {e}"
+        )
+
+
+# =========================================================
+# GENERIC AI ENDPOINT
+# =========================================================
+
+@router.post("/intent-ai", response_model=AIIntentResponse)
+async def intent_ai(req: IntentAIRequest):
+    """
+    {
+        "system_prompt": "customer_intelligence",
+        "user_prompt": "call_summary",
+            "context": {
+                "transcript": "Customer said they are unhappy with pricing and considering competitor offers."
+            }
+    }
+
+    {
+    "system_prompt": "opportunity_upsell_extractor",
+    "user_prompt": "opportunity_upsell_extractor",
+        "context": {
+            "transcript": "Customer wants to upgrade from basic plan to enterprise plan due to scaling needs",
+            "account_id": "001ABC123"
+        }
+    }    
+    """
+    started = datetime.utcnow()
+
+    system_template = ai_cc_salesforce_prompt.SYSTEM_PROMPTS.get(req.system_prompt)
+    user_template = ai_cc_salesforce_prompt.USER_PROMPTS.get(req.user_prompt)
+
+    merged = req.context or {}
+
+    system_prompt = system_template
+    user_prompt = render_prompt(user_template, merged)
+    model= (req.options or {}).get("model", "gpt-4o-mini")
+    response = AIClients.llm().chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0
+        )
+
+    raw = response.choices[0].message.content
+
+    try:
+        parsed = json.loads(raw)
+
+    except Exception:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Invalid JSON returned: {raw}"
+        )
+
+    return AIIntentResponse(
+        result=parsed,
+        model=model,
+        confidence=parsed.get("AI_Confidence_Score__c")
+    )

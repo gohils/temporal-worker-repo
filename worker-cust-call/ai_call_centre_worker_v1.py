@@ -20,13 +20,11 @@ with workflow.unsafe.imports_passed_through():
         log_activity,
         upsert_workflow_instance,
         store_call_transcript,
-        get_call_transcript,
-        store_erp_document        
+        get_call_transcript
     )
 
     from salesforce_cc_utils import (
-        upsert_opportunity_by_external_id,
-        enroll_contact_into_campaign_by_external_id
+        upsert_opportunity_by_external_id
     )
 
 
@@ -97,34 +95,21 @@ def merge_context(parent, child):
     }
 
 
-async def execute_step(activity_fn, payload, context, step, timeout=30):
+async def execute_step(fn, payload, context, step, timeout=60):
+    context = {**context, "current_node_id": step}
 
-    prev_node = context.get("current_node_id")
-
-    context = {
-        **context,
-        "prev_node_id": prev_node,
-        "current_node_id": step,
-        "branch_id": context.get("branch_id", "MAIN"),
-    }
-
-    result: ActivityOutput = await workflow.execute_activity(
-        activity_fn,
+    result = await workflow.execute_activity(
+        fn,
         ActivityInput(payload, context),
         start_to_close_timeout=timedelta(seconds=timeout),
         retry_policy=RetryPolicy(maximum_attempts=3),
     )
 
     payload = {**payload, **result.response}
+    context = merge_context(context, result.context)
 
-    business_context = merge_context(context, result.context)
+    return payload, context
 
-    # 🔒 Preserve graph state
-    business_context["prev_node_id"] = context["prev_node_id"]
-    business_context["current_node_id"] = context["current_node_id"]
-    business_context["branch_id"] = context["branch_id"]
-
-    return payload, business_context
 
 # =========================================================
 # DETERMINISTIC CRM FIELD ENGINE (CRITICAL)
@@ -151,7 +136,7 @@ def generate_deterministic_fields(opportunity_type: str):
     return {
         "CloseDate": close_date,
         "StageName": stage,
-        "Amount": 1200
+        "Amount": 0
     }
 
 
@@ -159,7 +144,7 @@ def generate_deterministic_fields(opportunity_type: str):
 # 1 INGEST
 # =========================================================
 @activity.defn
-@log_activity(display_name="01_INGEST_AUDIO_CALL")
+@log_activity(display_name="01_INGEST")
 async def ingest_call(input: ActivityInput) -> ActivityOutput:
 
     item = input.payload.get("items", [{}])[0]
@@ -187,7 +172,7 @@ async def ingest_call(input: ActivityInput) -> ActivityOutput:
 # 2 TRANSCRIBE
 # =========================================================
 @activity.defn
-@log_activity(display_name="02_TRANSCRIBE_CALL")
+@log_activity(display_name="02_TRANSCRIBE")
 async def transcribe_call(input: ActivityInput) -> ActivityOutput:
 
     audio_url = input.payload["audio_url"]
@@ -198,7 +183,7 @@ async def transcribe_call(input: ActivityInput) -> ActivityOutput:
 
     async with httpx.AsyncClient(timeout=120) as client:
         r = await client.post(
-            f"{AI_API_URL}/ai_doc_llm/transcribe-audio",
+            f"{AI_API_URL}/transcribe-audio",
             json={"audio_url": audio_url}
         )
         r.raise_for_status()
@@ -218,8 +203,8 @@ async def transcribe_call(input: ActivityInput) -> ActivityOutput:
 # 3 ROUTER (LLM ONLY CLASSIFICATION)
 # =========================================================
 @activity.defn
-@log_activity(display_name="03_AI_INTENT_DETECTION")
-async def ai_intent_detection(input: ActivityInput) -> ActivityOutput:
+@log_activity(display_name="03_OPPORTUNITY_ROUTER")
+async def opportunity_router(input: ActivityInput) -> ActivityOutput:
 
     result = await call_intent_ai(
         system_prompt="opportunity_router",
@@ -276,8 +261,8 @@ async def run_opportunity_extractor_core(prompt_name: str, opp_type: str, input:
     )
 
 @activity.defn
-@log_activity(display_name="04_AI_OPPORTUNITY_RETENTION")
-async def ai_opportunity_retention(input: ActivityInput) -> ActivityOutput:
+@log_activity(display_name="04_RETENTION_EXTRACTOR")
+async def opportunity_retention_extractor(input: ActivityInput) -> ActivityOutput:
     return await run_opportunity_extractor_core(
         "opportunity_retention_extractor",
         "Retention",
@@ -285,8 +270,8 @@ async def ai_opportunity_retention(input: ActivityInput) -> ActivityOutput:
     )
 
 @activity.defn
-@log_activity(display_name="04_AI_OPPORTUNITY_UPSELL")
-async def ai_opportunity_upsell(input: ActivityInput) -> ActivityOutput:
+@log_activity(display_name="04_UPSELL_EXTRACTOR")
+async def opportunity_upsell_extractor(input: ActivityInput) -> ActivityOutput:
     return await run_opportunity_extractor_core(
         "opportunity_upsell_extractor",
         "Upsell",
@@ -294,8 +279,8 @@ async def ai_opportunity_upsell(input: ActivityInput) -> ActivityOutput:
     )
 
 @activity.defn
-@log_activity(display_name="04_AI_OPPORTUNITY_CROSS_SELL")
-async def ai_opportunity_cross_sell(input: ActivityInput) -> ActivityOutput:
+@log_activity(display_name="04_CROSSSELL_EXTRACTOR")
+async def opportunity_cross_sell_extractor(input: ActivityInput) -> ActivityOutput:
     return await run_opportunity_extractor_core(
         "opportunity_cross_sell_extractor",
         "Cross-sell",
@@ -304,55 +289,14 @@ async def ai_opportunity_cross_sell(input: ActivityInput) -> ActivityOutput:
 
 
 # =========================================================
-# 05B CRM STAGING (REUSING ERP TABLE)
-# =========================================================
-@activity.defn
-@log_activity(display_name="05_REGISTER_SALES_OPPORTUNITY")
-async def register_sales_opportunity(input: ActivityInput) -> ActivityOutput:
-
-    opp = input.payload.get("opportunity_payload")
-
-    if not opp:
-        return ActivityOutput({"status": "SKIPPED"}, {})
-
-    import uuid
-
-    doc_id = f"CRM-{uuid.uuid4().hex[:10]}"
-
-    store_erp_document(
-        doc_id=doc_id,
-        doc_type="crm_opportunity",   # 👈 key change (separates ERP vs CRM)
-        workflow_id=input.context.get("workflow_id"),
-        header_id=input.context.get("header_id"),
-        item_id=input.context.get("item_id"),
-        header_data={
-            "staging_type": "SALESFORCE_OPPORTUNITY",
-            "payload": opp
-        },
-        approval_status="STAGED",
-        approved_by="SYSTEM",
-        reference_id=input.context.get("reference_id"),
-    )
-
-    return ActivityOutput(
-        {
-            **input.payload,
-            "REGISTER_SALES_OPPORTUNITY_doc_id": doc_id
-        },
-        {
-            "crm_stage": {
-                "doc_id": doc_id,
-                "status": "STAGED"
-            }
-        }
-    )
-
-# =========================================================
 # 5 CRM WRITE (SAFE + ID EMPOTENT)
 # =========================================================
+# =========================================================
+# 5 CRM WRITE
+# =========================================================
 @activity.defn
-@log_activity(display_name="06_SALESFORCE_OPPORTUNITY_CREATION")
-async def salesforce_opportunity_creation(input: ActivityInput)->ActivityOutput:
+@log_activity(display_name="05_CRM_WRITE")
+async def create_salesforce_opportunity_if_needed(input: ActivityInput)->ActivityOutput:
 
     opp=input.payload.get("opportunity_payload")
 
@@ -361,16 +305,7 @@ async def salesforce_opportunity_creation(input: ActivityInput)->ActivityOutput:
 
     try:
 
-        customer_id = input.context.get("customer_id")
-        norm_opp_type = opp.get("Type").lower().replace("_", "-").replace(" ", "-")
-        print("norm_opp_type======",norm_opp_type)
-        amount = 1200
-        if norm_opp_type == "retention":
-            amount = 2400
-        elif norm_opp_type == "upsell":
-            amount = 1200
-        elif norm_opp_type in ("cross-sell", "crosssell"):
-            amount = 600
+        customer_id=input.context["customer_id"]
 
         result=upsert_opportunity_by_external_id(
             customer_external_id=customer_id,
@@ -389,7 +324,8 @@ async def salesforce_opportunity_creation(input: ActivityInput)->ActivityOutput:
             ),
 
             close_date=opp.get("CloseDate"),
-            amount=opp.get("Amount",500),
+            amount=opp.get("Amount",0),
+
             opp_sub_type=opp.get("Opportunity_Sub_Type__c"),
             ai_call_summary=opp.get("AI_Call_Summary__c"),
             ai_confidence_score=opp.get("AI_Confidence_Score__c"),
@@ -417,58 +353,11 @@ async def salesforce_opportunity_creation(input: ActivityInput)->ActivityOutput:
             {}
         )
 
-campaign_map = {
-    "retention": "CUSTOMER_RETENTION_PROGRAM",
-    "upsell": "CUSTOMER_GROWTH_PROGRAM",
-    "crosssell": "REVENUE_EXPANSION_PROGRAM",
-    "cross-sell": "REVENUE_EXPANSION_PROGRAM"
-}
-
-@activity.defn
-@log_activity(display_name="07_CAMPAIGN_ENROLLMENT")
-async def salesforce_campaign_enrollment(input: ActivityInput) -> ActivityOutput:
-
-    opp = input.payload.get("opportunity_payload")
-
-    if not opp:
-        return ActivityOutput(
-            {"status": "SKIPPED_NO_OPPORTUNITY"},
-            {}
-        )
-
-    opp_type = opp.get("Type")
-    opportunity_type = opp_type.lower().replace("_", "-").replace(" ", "-")
-    print("opportunity_type======",opportunity_type)
-    campaign_name = campaign_map.get(opportunity_type)
-    customer_id = input.context.get("customer_id")
-
-    try:
-
-        result = enroll_contact_into_campaign_by_external_id(customer_external_id=customer_id, campaign_name=campaign_name)
-
-        return ActivityOutput(
-            {
-                "status": "SUCCESS",
-                "campaign_name": campaign_name,
-                "campaign_result": result
-            },
-            {}
-        )
-
-    except Exception as e:
-        return ActivityOutput(
-            {
-                "status": "FAILED",
-                "reason": str(e)
-            },
-            {}
-        )
-    
 # =========================================================
 # 6 AUDIT
 # =========================================================
 @activity.defn
-@log_activity(display_name="08_AUDIT")
+@log_activity(display_name="06_AUDIT")
 async def audit(input: ActivityInput) -> ActivityOutput:
     print(json.dumps(input.payload, indent=2))
     return ActivityOutput({"status": "AUDITED"}, {})
@@ -488,13 +377,13 @@ class CustomerCallWorkflow:
         payload = initial_payload.copy()
 
         # 1 INGEST
-        payload, context = await execute_step(ingest_call, payload, context, "INGEST_AUDIO_CALL")
+        payload, context = await execute_step(ingest_call, payload, context, "INGEST")
 
         # 2 TRANSCRIBE
-        payload, context = await execute_step(transcribe_call, payload, context, "TRANSCRIBE_AUDIO_CALL")
+        payload, context = await execute_step(transcribe_call, payload, context, "TRANSCRIBE")
 
         # 3 ROUTER
-        payload, context = await execute_step(ai_intent_detection, payload, context, "AI_INTENT_DETECTION")
+        payload, context = await execute_step(opportunity_router, payload, context, "ROUTER")
 
         # 4 EXTRACTOR
         opp_type = payload.get("opportunity_type")
@@ -510,7 +399,7 @@ class CustomerCallWorkflow:
         print("norm_opp_type======",norm_opp_type)
         if norm_opp_type == "retention":
             payload, context = await execute_step(
-                ai_opportunity_retention,
+                opportunity_retention_extractor,
                 payload,
                 context,
                 "RETENTION_EXTRACTOR"
@@ -518,15 +407,15 @@ class CustomerCallWorkflow:
 
         elif norm_opp_type == "upsell":
             payload, context = await execute_step(
-                ai_opportunity_upsell,
+                opportunity_upsell_extractor,
                 payload,
                 context,
                 "UPSELL_EXTRACTOR"
             )
 
-        elif norm_opp_type in ("cross-sell", "crosssell"):
+        elif norm_opp_type == "cross-sell":
             payload, context = await execute_step(
-                ai_opportunity_cross_sell,
+                opportunity_cross_sell_extractor,
                 payload,
                 context,
                 "CROSSSELL_EXTRACTOR"
@@ -534,23 +423,11 @@ class CustomerCallWorkflow:
         else:
             raise ValueError(f"Unknown opportunity type: {opp_type}")
         
-        # 5 CRM register_sales_opportunity
-        payload, context = await execute_step(register_sales_opportunity, payload, context, "REGISTER_SALES_OPPORTUNITY")
-        payload, context = await execute_step(salesforce_opportunity_creation, payload, context, "OPPORTUNITY_CREATION")
-        payload, context = await execute_step(salesforce_campaign_enrollment, payload, context, "CAMPAIGN_ENROLLMENT")
+        # 5 CRM
+        payload, context = await execute_step(create_salesforce_opportunity_if_needed, payload, context, "CRM")
 
         # 6 AUDIT
         await execute_step(audit, payload, context, "AUDIT")
-
-        upsert_workflow_instance(
-            workflow_id=wf_id,
-            workflow_type=payload.get("workflow_type"),
-            status="COMPLETED",
-            input_data=payload,
-            header_id=payload.get("header_id"),
-            reference_id=payload.get("reference_id"),
-            end_time=workflow.now()
-        )
 
         return {
             "status": "COMPLETED",
@@ -571,13 +448,11 @@ async def main():
         activities=[
             ingest_call,
             transcribe_call,
-            ai_intent_detection,
-            ai_opportunity_retention,
-            ai_opportunity_upsell,
-            ai_opportunity_cross_sell,
-            register_sales_opportunity,
-            salesforce_opportunity_creation,
-            salesforce_campaign_enrollment,
+            opportunity_router,
+            opportunity_retention_extractor,
+            opportunity_upsell_extractor,
+            opportunity_cross_sell_extractor,
+            create_salesforce_opportunity_if_needed,
             audit
         ],
     )

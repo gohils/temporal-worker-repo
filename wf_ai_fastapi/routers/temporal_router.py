@@ -990,6 +990,7 @@ TASK_QUEUE_MAP = {
     "InvoiceProcessingWorkflow": "finance-invoice-queue",
     "CustomerOnboardingWorkflow": "kyc-onboarding-queue",
     "DirectDebitWorkflow": "direct-debit-queue",
+    "CustomerCallWorkflow": "call-centre-ai-queue",
     "ExpenseClaimWorkflow": "expense-claim-queue"}
 @router.post("/workflow_start_by_reference/{reference_id}")
 async def start_workflow_by_reference(reference_id: str):
