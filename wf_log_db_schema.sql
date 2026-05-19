@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS workflow_instance (
     reference_id TEXT,
     -- Link to header / case
     header_id BIGINT ,
+    item_id BIGINT ,
 
     parent_workflow TEXT,
     workflow_group TEXT,
@@ -139,6 +140,9 @@ CREATE TABLE IF NOT EXISTS workflow_ocr_data (
     created_at TIMESTAMP DEFAULT NOW(),
     updated_at TIMESTAMP DEFAULT NOW()
 );
+
+ALTER TABLE workflow_ocr_data
+ADD CONSTRAINT uq_workflow_item UNIQUE (workflow_id, item_id);
 
 -- =========================================================
 -- 5. ERP / CRM DOCUMENT STORE (Final output layer)

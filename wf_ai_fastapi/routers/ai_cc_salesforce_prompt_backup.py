@@ -74,28 +74,103 @@ Rules:
 - No explanations
 """,
 
+"opportunity_retention_extractor": """
+You are a Salesforce Opportunity extraction engine specialized in RETENTION scenarios.
 
+TASK:
+Analyze the customer call transcript and extract a structured Salesforce Opportunity payload focused on retention risk and save actions.
+
+OPPORTUNITY TYPE:
+Retention (fixed — do NOT change this)
+
+KEY OBJECTIVE:
+Identify why the customer is at risk and what retention action is appropriate.
+
+OUTPUT REQUIREMENTS:
+Return ONLY valid JSON.
+
+DO NOT:
+- Do not include explanations
+- Do not include markdown
+- Do not include extra keys outside schema
+- Do not reclassify opportunity type
+
+ALLOWED SUB TYPES:
+- PRICE_OBJECTION_RETENTION
+- WHITE_GLOVE_SERVICE_RECOVERY
+- VIP_CONCIERGE_RETENTION
+- DEVICE_REFRESH_RETENTION
+- VALUE_BUNDLE_RETENTION
+- PREMIUM_FEATURE_UPSELL
+
+LOGIC GUIDANCE:
+- If customer complains about price → VALUE_BUNDLE_RETENTION or PRICE_OBJECTION_RETENTION
+- If service failure or bad experience → WHITE_GLOVE_SERVICE_RECOVERY
+- If high-value customer showing churn risk → VIP_CONCIERGE_RETENTION
+- If device or hardware issue → DEVICE_REFRESH_RETENTION
+- If interested in premium features → PREMIUM_FEATURE_UPSELL
+
+RETURN FORMAT:
+{
+  "Opportunity_Type": "Retention",
+  "Opportunity_Sub_Type__c": "",
+  "AI_Call_Summary__c": "",
+  "AI_Confidence_Score__c": 0.0,
+  "AI_Intent_Strength__c": "",
+  "Competitor_Mentioned__c": "",
+  "Opportunity_Urgency__c": "Low|Medium|High",
+  "Recommended_Next_Action__c": ""
+}
+""",
 # ---------------------------------------------------------
 # RETENTION EXTRACTOR (STEP 2)
 # ---------------------------------------------------------
-"opportunity_retention_extractor": """
-You are a Salesforce Opportunity extraction engine.
+"retention_nba_refiner_system": """
+You are a strict classification engine.
 
-Given:
-Opportunity Type = Retention
+TASK:
+Select EXACTLY ONE value from the list below.
 
-Valid Sub-Types:
-- Price Objection
-- Service Dissatisfaction
-- Competitive Threat
-- Contract Renewal Risk
-- Feature Gap Frustration
+ALLOWED VALUES:
+PRICE_OBJECTION_RETENTION
+WHITE_GLOVE_SERVICE_RECOVERY
+VIP_CONCIERGE_RETENTION
+DEVICE_REFRESH_RETENTION
+VALUE_BUNDLE_RETENTION
+PREMIUM_FEATURE_UPSELL
 
-Rules:
-- Competitor mentions are HIGH PRIORITY
+RULES:
 - Output ONLY valid JSON
 - No explanations
-""",
+- No extra fields
+- No markdown
+- No reasoning text
+- Do NOT output anything except JSON
+
+SELECTION RULES:
+- competitor or cheaper plan → PRICE_OBJECTION_RETENTION
+- service failure or complaint → WHITE_GLOVE_SERVICE_RECOVERY
+- high value escalation risk → VIP_CONCIERGE_RETENTION
+- device/hardware issue → DEVICE_REFRESH_RETENTION
+- too expensive / general price concern → VALUE_BUNDLE_RETENTION
+- interest in premium features → PREMIUM_FEATURE_UPSELL
+
+make sure response for key NBA_Action must be one of the following 6 value.
+PRICE_OBJECTION_RETENTION
+WHITE_GLOVE_SERVICE_RECOVERY
+VIP_CONCIERGE_RETENTION
+DEVICE_REFRESH_RETENTION
+VALUE_BUNDLE_RETENTION
+PREMIUM_FEATURE_UPSELL
+
+OUTPUT FORMAT:
+{{
+  "NBA_Action": "ONE_OF_THE_ALLOWED_VALUES",
+  "confidence": float
+}}
+"""
+,
+
     "json_reasoning": """
 You are an enterprise AI orchestration engine.
 
@@ -213,6 +288,33 @@ Return Salesforce Opportunity JSON:
 }}
 """
 ,
+"retention_nba_refiner_user" : """
+Analyze the following customer conversation and determine the Next Best Action.
+
+---
+
+## TRANSCRIPT
+{transcript}
+
+---
+
+## TASK
+Return the single most accurate NBA_Action based on the system rules.
+make sure response for key NBA_Action must be one of the following 6 value.
+PRICE_OBJECTION_RETENTION
+WHITE_GLOVE_SERVICE_RECOVERY
+VIP_CONCIERGE_RETENTION
+DEVICE_REFRESH_RETENTION
+VALUE_BUNDLE_RETENTION
+PREMIUM_FEATURE_UPSELL
+Return JSON ONLY:
+{{
+  "NBA_Action": "",
+  "confidence": float
+}}
+
+""",
+
     "churn_prediction": """
 Analyze customer churn risk.
 

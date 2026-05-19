@@ -33,13 +33,27 @@ with workflow.unsafe.imports_passed_through():
 # =========================================================
 # CONFIG
 # =========================================================
-TEMPORAL_HOST = os.getenv("TEMPORAL_HOST", "localhost:7233")
+TEMPORAL_HOST = os.getenv("TEMPORAL_HOST", "temporal-server-demo.australiaeast.cloudapp.azure.com:7233")
 TASK_QUEUE = os.getenv("TASK_QUEUE", "call-centre-ai-queue")
-AI_API_URL = os.getenv("AI_API_URL", "http://localhost:8000")
+AI_API_URL = os.getenv("AI_API_URL", "https://temporal-fastapi.livelysand-fad44e9f.australiaeast.azurecontainerapps.io")
+# AI_API_URL = os.getenv("AI_API_URL", "http://localhost:8000")
 
+campaign_map = {
+    "retention": "CUSTOMER_RETENTION_PROGRAM",
+    "upsell": "CUSTOMER_GROWTH_PROGRAM",
+    "crosssell": "REVENUE_EXPANSION_PROGRAM",
+    "cross-sell": "REVENUE_EXPANSION_PROGRAM"
+}
 
-# =========================================================
-# CONTRACTS
+retention_campaign_map = {
+    "VALUE_BUNDLE_RETENTION": "BUNDLE_SAVERS_CAMPAIGN",
+    "WHITE_GLOVE_SERVICE_RECOVERY": "SERVICE_UPGRADE_CAMPAIGN",
+    "DEVICE_REFRESH_RETENTION": "DEVICE_UPGRADE_CAMPAIGN",
+    "PREMIUM_FEATURE_UPSELL": "FEATURE_UNLOCK_RETENTION_CAMPAIGN",
+    "VIP_CONCIERGE_RETENTION": "VIP_TREATMENT_CAMPAIGN",
+    "PRICE_OBJECTION_RETENTION": "PRICE_OBJECTION_CAMPAIGN"
+}
+
 # =========================================================
 @dataclass
 class ActivityInput:
@@ -56,23 +70,27 @@ class ActivityOutput:
 # =========================================================
 # HELPERS
 # =========================================================
-async def call_intent_ai(system_prompt, user_prompt, context, options=None):
+async def call_intent_ai(prompt_name, context, options=None):
+
     async with httpx.AsyncClient(timeout=60) as client:
+        payload = {
+            "prompt_name": prompt_name,
+            "context": context or {},
+            "options": options or {}
+        }
+
         resp = await client.post(
             f"{AI_API_URL}/ai_doc_llm/intent-ai",
-            json={
-                "system_prompt": system_prompt,
-                "user_prompt": user_prompt,
-                "context": context or {},
-                "options": options or {},
-            }
+            json=payload
         )
 
     if resp.status_code != 200:
-        raise Exception(f"Intent AI failed: {resp.text}")
+        print("\n==== INTENT AI FAILURE ====")
+        print(resp.text)
+        print(payload)
+        raise Exception(resp.text)
 
     return resp.json()
-
 
 def build_base_context(payload, wf_id):
     declared = payload.get("declared_data", {})
@@ -126,6 +144,9 @@ async def execute_step(activity_fn, payload, context, step, timeout=30):
 
     return payload, business_context
 
+def normalize_type(t: str):
+    return (t or "").strip().lower().replace("_", "-").replace(" ", "-")
+
 # =========================================================
 # DETERMINISTIC CRM FIELD ENGINE (CRITICAL)
 # =========================================================
@@ -135,17 +156,17 @@ def generate_deterministic_fields(opportunity_type: str):
     """
 
     now = datetime.utcnow()
-
-    if opportunity_type == "Retention":
-        close_date = (now + timedelta(days=3)).strftime("%Y-%m-%d")
+    opportunity_type_lc = normalize_type(opportunity_type) 
+    if opportunity_type_lc == "retention":
+        close_date = (now + timedelta(days=7)).strftime("%Y-%m-%d")
         stage = "At Risk"
 
-    elif opportunity_type == "Upsell":
+    elif opportunity_type_lc == "upsell":
         close_date = (now + timedelta(days=14)).strftime("%Y-%m-%d")
         stage = "Qualification"
 
     else:  # Cross-sell
-        close_date = (now + timedelta(days=10)).strftime("%Y-%m-%d")
+        close_date = (now + timedelta(days=14)).strftime("%Y-%m-%d")
         stage = "Qualification"
 
     return {
@@ -221,38 +242,76 @@ async def transcribe_call(input: ActivityInput) -> ActivityOutput:
 @log_activity(display_name="03_AI_INTENT_DETECTION")
 async def ai_intent_detection(input: ActivityInput) -> ActivityOutput:
 
-    result = await call_intent_ai(
-        system_prompt="opportunity_router",
-        user_prompt="opportunity_router",
+    llm_response = await call_intent_ai(
+        prompt_name="opportunity_router",
         context={"transcript": input.payload["transcript"]}
     )
+    result = llm_response.get("result", llm_response)
 
     return ActivityOutput(
         {
-            "opportunity_type": result["result"]["opportunity_type"],
-            "confidence": result["result"]["confidence"]
-        },
-        {}
+            "opportunity_type": result.get("opportunity_type"),
+            "confidence": result.get("confidence")
+        },   {}
     )
-
 
 # =========================================================
 # 4 EXTRACTOR (LLM + BUSINESS ENRICHMENT)
 # =========================================================
+async def ai_retention_campaign_router(transcript: str):
+
+    try:
+        result = await call_intent_ai(
+            prompt_name="ai_retention_campaign_router",
+            context={
+                "transcript": transcript
+            }
+        )
+
+        print("\n================ NBA refinement raw =================\n",result)
+
+        # 🔒 SAFE ACCESS
+        llm_result = result.get("result") or result
+
+        # 🔒 Defensive extraction
+        next_best_campaign = llm_result.get("next_best_campaign")
+
+        if not next_best_campaign:
+            print("[WARN] next_best_campaign missing from LLM output")
+            return None
+
+        return next_best_campaign
+
+    except Exception as e:
+        print(f"[ERROR] NBA refinement failed: {e}")
+        return None
+
 async def run_opportunity_extractor_core(prompt_name: str, opp_type: str, input: ActivityInput) -> ActivityOutput:
 
-    result = await call_intent_ai(
-        system_prompt=prompt_name,
-        user_prompt=prompt_name,
+    llm_response = await call_intent_ai(
+        prompt_name=prompt_name,
         context={
             "transcript": input.payload["transcript"],
             "account_id": input.context["customer_id"]
         }
     )
 
-    llm = result["result"]
+    # IMPORTANT FIX
+    llm_result = llm_response.get("result", llm_response)
 
+    print("=======run_opportunity_extractor_core======llm result =========",llm_result)
     deterministic = generate_deterministic_fields(opp_type)
+
+    llm_opportunity_type = normalize_type( llm_result.get("opportunity_type") or llm_result.get("Opportunity_Type")  or opp_type )
+    next_best_campaign = None
+    if llm_opportunity_type == "retention":
+        next_best_campaign = await ai_retention_campaign_router(
+            transcript=input.payload["transcript"]
+        )
+
+        # fallback chain (very important)
+        if not next_best_campaign:
+            next_best_campaign = "CUSTOMER_RETENTION_PROGRAM"
 
     return ActivityOutput(
         {
@@ -263,26 +322,42 @@ async def run_opportunity_extractor_core(prompt_name: str, opp_type: str, input:
 
                 **deterministic,
 
-                "Opportunity_Sub_Type__c": llm.get("Opportunity_Sub_Type__c"),
-                "AI_Call_Summary__c": llm.get("AI_Call_Summary__c"),
-                "AI_Confidence_Score__c": llm.get("AI_Confidence_Score__c", 0),
-                "AI_Intent_Strength__c": llm.get("AI_Intent_Strength__c"),
-                "Competitor_Mentioned__c": llm.get("Competitor_Mentioned__c"),
-                "Opportunity_Urgency__c": llm.get("Opportunity_Urgency__c"),
-                "Recommended_Next_Action__c": llm.get("Recommended_Next_Action__c"),
+                "Primary_Churn_Driver__c": llm_result.get("Primary_Churn_Driver__c"),
+                "Next_Best_Campaign__c": next_best_campaign,
+                "Opportunity_Sub_Type__c": llm_result.get("Opportunity_Sub_Type__c"),
+                "AI_Call_Summary__c": llm_result.get("AI_Call_Summary__c"),
+                "AI_Confidence_Score__c": llm_result.get("AI_Confidence_Score__c", 0),
+                "AI_Intent_Strength__c": llm_result.get("AI_Intent_Strength__c"),
+                "Competitor_Mentioned__c": llm_result.get("Competitor_Mentioned__c"),
+                "Opportunity_Urgency__c": llm_result.get("Opportunity_Urgency__c"),
+                "Recommended_Next_Action__c": llm_result.get("Recommended_Next_Action__c"),
             }
         },
         {}
     )
 
+
 @activity.defn
 @log_activity(display_name="04_AI_OPPORTUNITY_RETENTION")
 async def ai_opportunity_retention(input: ActivityInput) -> ActivityOutput:
-    return await run_opportunity_extractor_core(
-        "opportunity_retention_extractor",
-        "Retention",
-        input
-    )
+    try:
+        return await run_opportunity_extractor_core(
+            "opportunity_retention_extractor",
+            "Retention",
+            input
+        )
+    except Exception as e:
+        return ActivityOutput(
+            {
+                "opportunity_payload": {
+                    "Type": "Retention",
+                    "Opportunity_Sub_Type__c": "VALUE_BUNDLE_RETENTION",
+                    "AI_Call_Summary__c": "Fallback due to AI failure",
+                    "AI_Confidence_Score__c": 0.0
+                }
+            },
+            {}
+        )
 
 @activity.defn
 @log_activity(display_name="04_AI_OPPORTUNITY_UPSELL")
@@ -396,7 +471,10 @@ async def salesforce_opportunity_creation(input: ActivityInput)->ActivityOutput:
             ai_intent_strength=opp.get("AI_Intent_Strength__c"),
             competitor_mentioned=opp.get("Competitor_Mentioned__c"),
             opportunity_urgency=opp.get("Opportunity_Urgency__c"),
-            recommended_next_action=opp.get("Recommended_Next_Action__c")
+            recommended_next_action=opp.get("Recommended_Next_Action__c"),
+            next_best_campaign=opp.get("Next_Best_Campaign__c"),
+            primary_churn_driver=opp.get("Primary_Churn_Driver__c"),
+
         )
 
         return ActivityOutput(
@@ -417,13 +495,6 @@ async def salesforce_opportunity_creation(input: ActivityInput)->ActivityOutput:
             {}
         )
 
-campaign_map = {
-    "retention": "CUSTOMER_RETENTION_PROGRAM",
-    "upsell": "CUSTOMER_GROWTH_PROGRAM",
-    "crosssell": "REVENUE_EXPANSION_PROGRAM",
-    "cross-sell": "REVENUE_EXPANSION_PROGRAM"
-}
-
 @activity.defn
 @log_activity(display_name="07_CAMPAIGN_ENROLLMENT")
 async def salesforce_campaign_enrollment(input: ActivityInput) -> ActivityOutput:
@@ -431,16 +502,26 @@ async def salesforce_campaign_enrollment(input: ActivityInput) -> ActivityOutput
     opp = input.payload.get("opportunity_payload")
 
     if not opp:
-        return ActivityOutput(
-            {"status": "SKIPPED_NO_OPPORTUNITY"},
-            {}
-        )
+        return ActivityOutput( {"status": "SKIPPED_NO_OPPORTUNITY"}, {}  )
 
     opp_type = opp.get("Type")
     opportunity_type = opp_type.lower().replace("_", "-").replace(" ", "-")
     print("opportunity_type======",opportunity_type)
-    campaign_name = campaign_map.get(opportunity_type)
+
+    campaign_name = None
+
+    if opportunity_type == "retention":
+        nba = opp.get("Next_Best_Campaign__c")
+
+        campaign_name = retention_campaign_map.get(nba)
+
+        if not campaign_name:
+            campaign_name = campaign_map.get("retention")
+    else:        
+        campaign_name = campaign_map.get(opportunity_type)
     customer_id = input.context.get("customer_id")
+
+    print("campaign_name======",campaign_name)
 
     try:
 
@@ -470,7 +551,7 @@ async def salesforce_campaign_enrollment(input: ActivityInput) -> ActivityOutput
 @activity.defn
 @log_activity(display_name="08_AUDIT")
 async def audit(input: ActivityInput) -> ActivityOutput:
-    print(json.dumps(input.payload, indent=2))
+    # print(json.dumps(input.payload, indent=2))
     return ActivityOutput({"status": "AUDITED"}, {})
 
 

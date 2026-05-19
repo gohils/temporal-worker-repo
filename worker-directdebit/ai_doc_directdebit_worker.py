@@ -29,10 +29,9 @@ with workflow.unsafe.imports_passed_through():
 # -----------------------------
 # CONFIG
 # -----------------------------
-# TEMPORAL_HOST = os.getenv("TEMPORAL_HOST", "temporal-server-demo.australiaeast.cloudapp.azure.com:7233")
+TEMPORAL_HOST = os.getenv("TEMPORAL_HOST", "temporal-server-demo.australiaeast.cloudapp.azure.com:7233")
 TASK_QUEUE = os.getenv("TASK_QUEUE", "direct-debit-queue")
 AI_API_URL = os.getenv("AI_API_URL", "https://zdoc-ai-api.azurewebsites.net")
-TEMPORAL_HOST = "localhost:7233"
 # TASK_QUEUE = "direct-debit-queue"
 # AI_API_URL = os.getenv("AI_API_URL", "http://localhost:8000")
 

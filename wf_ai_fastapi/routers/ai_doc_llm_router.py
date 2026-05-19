@@ -13,8 +13,8 @@ from datetime import datetime
 # Import DB abstraction layer
 from wf_ai_fastapi.routers import bpm_prompts
 import wf_ai_fastapi.routers.process_db as db
-from wf_ai_fastapi.routers import ai_cc_salesforce_prompt
-
+import wf_ai_fastapi.routers.prompts.ai_cc_salesforce_prompt as ai_cc_salesforce_prompt
+import wf_ai_fastapi.routers.prompts.registry as prompts_registry
 # ---------------------------
 # Environment Validation
 # ---------------------------
@@ -51,19 +51,23 @@ class AIClients:
 # =========================================================
 # REQUEST / RESPONSE
 # =========================================================
-class AIReasoningRequest(BaseModel):
-    action: str
+# =========================================================
+# REQUEST (MINIMAL)
+# =========================================================
+class LLMRequest(BaseModel):
+    prompt: str
     context: Dict[str, Any] = Field(default_factory=dict)
-    options: Optional[Dict[str, Any]] = Field(default_factory=dict)
+    model: str = "gpt-4o-mini"
+    temperature: float = 0.0
 
 
-class AIReasoningResponse(BaseModel):
-    action: str
-    final_prompt: str
-    result: Dict[str, Any]
-    raw_response: Optional[str] = None
-    confidence: Optional[float] = None
-
+# =========================================================
+# RESPONSE (MINIMAL)
+# =========================================================
+class LLMResponse(BaseModel):
+    result: Any
+    raw_response: Optional[str]
+    prompt_used: str
 
 class TranscribeRequest(BaseModel):
     audio_url: str
@@ -71,8 +75,7 @@ class TranscribeRequest(BaseModel):
     call_id: Optional[str] = None
 
 class IntentAIRequest(BaseModel):
-    system_prompt: str
-    user_prompt: str
+    prompt_name: str
     context: Dict[str, Any] = Field(default_factory=dict)
     options: Optional[Dict[str, Any]] = Field(default_factory=dict)
 
@@ -81,80 +84,54 @@ class AIIntentResponse(BaseModel):
     model: str
     confidence: Optional[float] = None
 
-BUSINESS_SUMMARY_PROMPT = """
-You are a business operations assistant.
-
-Convert structured workflow analysis into a SHORT business explanation.
-
-Rules:
-- max 3–5 sentences
-- no JSON
-- simple business language
-- no technical terms like "OCR", "workflow_id"
-- focus on what happened + current status + next implication
-
-INPUT:
-{data}
-
-OUTPUT:
-A short business-friendly summary.
-"""
-
 # ---------------------------
-# LLM AI reasoning Endpoint
+# LLM AI generic Endpoint
 # ---------------------------
-@router.post("/ai-reasoning", response_model=AIReasoningResponse)
-async def ai_reasoning(req: AIReasoningRequest):
-    """Endpoint for AI reasoning on documents with action-aware context building and unified prompt transformation.
-            where_in_lifecycle, is_everything_correct, needs_attention, root_cause, what_next
+@router.post("/execute_llm", response_model=LLMResponse)
+async def execute_llm(req: LLMRequest):
+    """Endpoint for AI reasoning on documents 
     ```json
     {
-        "action": "where_in_lifecycle",
-        "context": {
-            "workflowId": "INV-20260414-B125B3-202604141803",
-            "headerId": 34,
-            "referenceId": "INV-20260414-B125B3"
-            }
+    "prompt": "Extract key fields from this document and return them in plain text: Be concise.",
+    "context": {
+            "document_text": "PASSPORT AUSTRALIA NO885237 Name: Marcus Anthony Seth ..."
+        }
     }
     ```
     """
     try:
-        # 1. build transaction context
-        header_id = req.context.get("headerId")
-        transaction_state_context = bpm_prompts.get_transaction_state(header_id)
+        # simple context injection (no framework logic here)
+        context_str = json.dumps(req.context, indent=2)
 
-        # 2. single unified transformation
-        final_prompt = bpm_prompts.build_prompt(req.action, transaction_state_context)
+        final_prompt = f"""
+{req.prompt}
 
-        # 3. LLM call
+CONTEXT:
+{context_str}
+"""
+
         response = AIClients.llm().chat.completions.create(
-            model=req.options.get("model", "gpt-4o-mini"),
+            model=req.model,
             messages=[
-                {"role": "system", "content": "Return ONLY JSON."},
                 {"role": "user", "content": final_prompt},
             ],
-            temperature=0
+            temperature=req.temperature,
         )
 
         raw = response.choices[0].message.content
 
-        try:
-            parsed = json.loads(raw)
-        except:
-            parsed = {"error": "invalid_json", "raw_response": raw}
-
-        return AIReasoningResponse(
-            action=req.action,
-            final_prompt=final_prompt,
-            result=parsed,
+        return LLMResponse(
+            result={"response": raw},
             raw_response=raw,
-            confidence=parsed.get("confidence")
+            prompt_used=final_prompt
         )
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-    
 
+# ---------------------------
+# LLM AI transcribe Endpoint
+# ---------------------------
 @router.post("/transcribe-audio")
 async def transcribe_audio(req: TranscribeRequest):
     """
@@ -240,59 +217,97 @@ def render_prompt(template: str, data: Dict[str, Any]):
 # =========================================================
 # GENERIC AI ENDPOINT
 # =========================================================
-
 @router.post("/intent-ai", response_model=AIIntentResponse)
 async def intent_ai(req: IntentAIRequest):
     """
-    {
-        "system_prompt": "customer_intelligence",
-        "user_prompt": "call_summary",
-            "context": {
-                "transcript": "Customer said they are unhappy with pricing and considering competitor offers."
-            }
-    }
-
-    {
-    "system_prompt": "opportunity_upsell_extractor",
-    "user_prompt": "opportunity_upsell_extractor",
-        "context": {
-            "transcript": "Customer wants to upgrade from basic plan to enterprise plan due to scaling needs",
-            "account_id": "001ABC123"
-        }
-    }    
+    Generic prompt execution endpoint using registry-based prompt contracts.
+    \n{ "prompt_name": "opportunity_router", "context": { "transcript": "Customer is considering cancelling due to pricing and comparing with competitors." } }
+    \n{ "prompt_name": "opportunity_upsell_extractor", "context": { "transcript": "Customer wants to upgrade from basic plan to enterprise plan due to scaling needs" } }
+    \n{ "prompt_name": "opportunity_cross_sell_extractor", "context": { "transcript": "Customer is interested in adding analytics and reporting module to existing CRM subscription" } }
+    \n{ "prompt_name": "opportunity_retention_extractor", "context": { "transcript": "Customer is unhappy with service outages and considering switching to a cheaper competitor plan" } }
+    \n{ "prompt_name": "retention_nba_refiner", "context": { "transcript": "Customer complains about pricing and wants to downgrade to a cheaper plan" } }  
     """
-    started = datetime.utcnow()
+ 
 
-    system_template = ai_cc_salesforce_prompt.SYSTEM_PROMPTS.get(req.system_prompt)
-    user_template = ai_cc_salesforce_prompt.USER_PROMPTS.get(req.user_prompt)
+    try:
+        started = datetime.utcnow()
 
-    merged = req.context or {}
+        # -------------------------------------------------
+        # 1. Fetch prompt config from registry
+        # -------------------------------------------------
+        prompt_config = prompts_registry.PROMPTS.get(req.prompt_name)
 
-    system_prompt = system_template
-    user_prompt = render_prompt(user_template, merged)
-    model= (req.options or {}).get("model", "gpt-4o-mini")
-    response = AIClients.llm().chat.completions.create(
+        if not prompt_config:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unknown prompt_name: {req.prompt_name}"
+            )
+
+        system_template = prompt_config["system"]
+        user_template = prompt_config["user"]
+
+        # -------------------------------------------------
+        # 2. Render user prompt with context
+        # -------------------------------------------------
+        user_prompt = render_prompt(
+            user_template,
+            req.context or {}
+        )
+
+        system_prompt = system_template
+
+        # -------------------------------------------------
+        # 3. Model config (optional override)
+        # -------------------------------------------------
+        model = (req.options or {}).get(
+            "model",
+            prompt_config.get("model", "gpt-4o-mini")
+        )
+
+        temperature = (req.options or {}).get(
+            "temperature",
+            prompt_config.get("temperature", 0.0)
+        )
+
+        # -------------------------------------------------
+        # 4. Call LLM
+        # -------------------------------------------------
+        response = AIClients.llm().chat.completions.create(
             model=model,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
-            temperature=0
+            temperature=temperature
         )
 
-    raw = response.choices[0].message.content
+        raw = response.choices[0].message.content
 
-    try:
-        parsed = json.loads(raw)
+        # -------------------------------------------------
+        # 5. Parse JSON safely
+        # -------------------------------------------------
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Invalid JSON returned: {raw}"
+            )
 
-    except Exception:
+        # -------------------------------------------------
+        # 6. Return response
+        # -------------------------------------------------
+        return AIIntentResponse(
+            result=parsed,
+            model=model,
+            confidence=parsed.get("AI_Confidence_Score__c")
+        )
+
+    except HTTPException:
+        raise
+
+    except Exception as e:
         raise HTTPException(
             status_code=500,
-            detail=f"Invalid JSON returned: {raw}"
+            detail=f"intent-ai execution failed: {str(e)}"
         )
-
-    return AIIntentResponse(
-        result=parsed,
-        model=model,
-        confidence=parsed.get("AI_Confidence_Score__c")
-    )

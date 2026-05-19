@@ -58,13 +58,16 @@ def upsert_opportunity_by_external_id(
     amount=0,
 
     # OPTIONAL AI FIELDS
+
     opp_sub_type=None,
     ai_call_summary=None,
     ai_confidence_score=None,
     ai_intent_strength=None,
     competitor_mentioned=None,
     opportunity_urgency=None,
-    recommended_next_action=None
+    recommended_next_action=None,
+    next_best_campaign=None,
+    primary_churn_driver=None
 ):
 
     token, instance_url = get_access_token()
@@ -97,7 +100,10 @@ def upsert_opportunity_by_external_id(
         "AI_Intent_Strength__c": ai_intent_strength,
         "Competitor_Mentioned__c": competitor_mentioned,
         "Opportunity_Urgency__c": opportunity_urgency,
-        "Recommended_Next_Action__c": recommended_next_action
+        "Recommended_Next_Action__c": recommended_next_action,
+        "Next_Best_Campaign__c": next_best_campaign,
+        "Primary_Churn_Driver__c":primary_churn_driver
+
     })
 
     print("=========Salesforce opportunity payload ========", payload)
@@ -105,7 +111,7 @@ def upsert_opportunity_by_external_id(
 
     # IMPORTANT: debug on failure
     if response.status_code >= 300:
-        print("ERROR:", response.status_code, r.text)
+        print("ERROR:", response.status_code, response.text)
     response.raise_for_status()
 
     print("✅ Opportunity Upsert Successful")
@@ -196,6 +202,8 @@ def enroll_contact_into_campaign_by_external_id(
         "ContactId": contact_id,
         "Status": "Added"
     }
+
+    print("=========Salesforce Campaign payload ========", payload)
 
     r = requests.post(url, json=payload, headers=headers)
 
